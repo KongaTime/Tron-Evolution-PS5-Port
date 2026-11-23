@@ -1,0 +1,974 @@
+#include "texture_cache.h"
+
+#include "guest_memory.h"
+#include "swizzle.h"
+
+#include "Common/interface/RefCntAutoPtr.hpp"
+#include "Graphics/GraphicsEngine/interface/DeviceContext.h"
+#include "Graphics/GraphicsEngine/interface/RenderDevice.h"
+#include "Graphics/GraphicsEngine/interface/Sampler.h"
+#include "Graphics/GraphicsEngine/interface/Texture.h"
+#include "Graphics/GraphicsEngine/interface/TextureView.h"
+
+#include <rex/graphics/pipeline/texture/conversion.h>
+#include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/util.h>
+#include <rex/cvar.h>
+#include <rex/graphics/xenos.h>
+#include <rex/logging/macros.h>
+
+#define XXH_STATIC_LINKING_ONLY  // XXH3_state_t on the stack
+#include <xxhash.h>
+
+#include <fmt/format.h>
+
+namespace renderer {
+// Texture upload time (timestamp ticks) for the perf log: loading (detile,
+// swap) and storing (texture creation / update).
+std::atomic<uint64_t> g_tex_load_ticks{0}, g_tex_store_ticks{0};
+}  // namespace renderer
+
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <cstring>
+#include <set>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace renderer {
+namespace {
+
+namespace dl = Diligent;
+namespace rg = rex::graphics;
+namespace xenos = rex::graphics::xenos;
+
+struct HostFormat {
+  dl::TEXTURE_FORMAT format;
+  uint32_t bytes_per_block;
+  // Signed variant (sampled through the translator's _s bindings): the texture
+  // is created typeless so both views exist. UNKNOWN if the SDK has no signed
+  // host format (DXT etc.; signed fetches then read zero, as in the SDK).
+  dl::TEXTURE_FORMAT typeless = dl::TEX_FORMAT_UNKNOWN;
+  dl::TEXTURE_FORMAT snorm = dl::TEX_FORMAT_UNKNOWN;
+};
+
+// Guest texture format -> host format with the same block size (data copied
+// after the endian swap; component order is handled by the fetch swizzle).
+bool GetHostFormat(xenos::TextureFormat format, HostFormat& out) {
+  switch (format) {
+    case xenos::TextureFormat::k_8:
+    case xenos::TextureFormat::k_8_A:
+    case xenos::TextureFormat::k_8_B:
+      out = {dl::TEX_FORMAT_R8_UNORM, 1, dl::TEX_FORMAT_R8_TYPELESS, dl::TEX_FORMAT_R8_SNORM};
+      return true;
+    case xenos::TextureFormat::k_8_8:
+      out = {dl::TEX_FORMAT_RG8_UNORM, 2, dl::TEX_FORMAT_RG8_TYPELESS, dl::TEX_FORMAT_RG8_SNORM};
+      return true;
+    case xenos::TextureFormat::k_8_8_8_8:
+    case xenos::TextureFormat::k_8_8_8_8_A:
+    case xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16:
+      out = {dl::TEX_FORMAT_RGBA8_UNORM, 4, dl::TEX_FORMAT_RGBA8_TYPELESS,
+             dl::TEX_FORMAT_RGBA8_SNORM};
+      return true;
+    case xenos::TextureFormat::k_2_10_10_10:
+    case xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16:
+      out = {dl::TEX_FORMAT_RGB10A2_UNORM, 4};
+      return true;
+    case xenos::TextureFormat::k_DXT1:
+    case xenos::TextureFormat::k_DXT1_AS_16_16_16_16:
+      out = {dl::TEX_FORMAT_BC1_UNORM, 8};
+      return true;
+    case xenos::TextureFormat::k_DXT2_3:
+    case xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16:
+      out = {dl::TEX_FORMAT_BC2_UNORM, 16};
+      return true;
+    case xenos::TextureFormat::k_DXT4_5:
+    case xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16:
+      out = {dl::TEX_FORMAT_BC3_UNORM, 16};
+      return true;
+    case xenos::TextureFormat::k_DXN: out = {dl::TEX_FORMAT_BC5_UNORM, 16}; return true;
+    case xenos::TextureFormat::k_16:
+      out = {dl::TEX_FORMAT_R16_UNORM, 2, dl::TEX_FORMAT_R16_TYPELESS, dl::TEX_FORMAT_R16_SNORM};
+      return true;
+    case xenos::TextureFormat::k_16_16:
+      out = {dl::TEX_FORMAT_RG16_UNORM, 4, dl::TEX_FORMAT_RG16_TYPELESS, dl::TEX_FORMAT_RG16_SNORM};
+      return true;
+    case xenos::TextureFormat::k_16_16_16_16:
+      out = {dl::TEX_FORMAT_RGBA16_UNORM, 8, dl::TEX_FORMAT_RGBA16_TYPELESS,
+             dl::TEX_FORMAT_RGBA16_SNORM};
+      return true;
+    // Float formats ignore the fetch's sign bits on Xenos: the signed binding
+    // samples the same float view. EXPAND formats are float16 (as the SDK).
+    case xenos::TextureFormat::k_16_FLOAT:
+    case xenos::TextureFormat::k_16_EXPAND:
+      out = {dl::TEX_FORMAT_R16_FLOAT, 2, dl::TEX_FORMAT_UNKNOWN, dl::TEX_FORMAT_R16_FLOAT};
+      return true;
+    case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_16_16_EXPAND:
+      out = {dl::TEX_FORMAT_RG16_FLOAT, 4, dl::TEX_FORMAT_UNKNOWN, dl::TEX_FORMAT_RG16_FLOAT};
+      return true;
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+    case xenos::TextureFormat::k_16_16_16_16_EXPAND:
+      out = {dl::TEX_FORMAT_RGBA16_FLOAT, 8, dl::TEX_FORMAT_UNKNOWN, dl::TEX_FORMAT_RGBA16_FLOAT};
+      return true;
+    case xenos::TextureFormat::k_32_FLOAT:
+      out = {dl::TEX_FORMAT_R32_FLOAT, 4, dl::TEX_FORMAT_UNKNOWN, dl::TEX_FORMAT_R32_FLOAT};
+      return true;
+    case xenos::TextureFormat::k_32_32_FLOAT:
+      out = {dl::TEX_FORMAT_RG32_FLOAT, 8, dl::TEX_FORMAT_UNKNOWN, dl::TEX_FORMAT_RG32_FLOAT};
+      return true;
+    case xenos::TextureFormat::k_32_32_32_32_FLOAT:
+      out = {dl::TEX_FORMAT_RGBA32_FLOAT, 16, dl::TEX_FORMAT_UNKNOWN, dl::TEX_FORMAT_RGBA32_FLOAT};
+      return true;
+    default: return false;
+  }
+}
+
+
+// TextureInfo::Prepare decodes the fetch constant (format tables, extents) and
+// was ~17% of the render thread in busy scenes; the result only depends on the
+// six fetch dwords, so it is cached (render thread only).
+bool PrepareTextureInfoCached(const xenos::xe_gpu_texture_fetch_t& fetch, rg::TextureInfo* out) {
+  struct Entry {
+    uint32_t dwords[6];
+    bool ok;
+    rg::TextureInfo info;
+  };
+  static std::unordered_map<uint64_t, Entry> cache;
+  uint32_t dwords[6];
+  std::memcpy(dwords, &fetch, sizeof(dwords));
+  uint64_t key = XXH3_64bits(dwords, sizeof(dwords));
+  auto it = cache.find(key);
+  if (it != cache.end() && std::memcmp(it->second.dwords, dwords, sizeof(dwords)) == 0) {
+    *out = it->second.info;
+    return it->second.ok;
+  }
+  if (cache.size() > 65536) cache.clear();
+  Entry e;
+  std::memcpy(e.dwords, dwords, sizeof(dwords));
+  e.ok = rg::TextureInfo::Prepare(fetch, &e.info);
+  cache[key] = e;
+  *out = e.info;
+  return e.ok;
+}
+
+dl::TEXTURE_ADDRESS_MODE AddressMode(xenos::ClampMode mode) {
+  switch (mode) {
+    case xenos::ClampMode::kRepeat: return dl::TEXTURE_ADDRESS_WRAP;
+    case xenos::ClampMode::kMirroredRepeat: return dl::TEXTURE_ADDRESS_MIRROR;
+    case xenos::ClampMode::kClampToEdge:
+    case xenos::ClampMode::kClampToHalfway: return dl::TEXTURE_ADDRESS_CLAMP;
+    case xenos::ClampMode::kClampToBorder: return dl::TEXTURE_ADDRESS_BORDER;
+    default: return dl::TEXTURE_ADDRESS_MIRROR_ONCE;
+  }
+}
+
+// Host channel layout per guest format (as the SDK Vulkan texture cache):
+// single-channel formats replicate R, two-channel formats are RGGG. Returned as
+// the host component (0-3) each guest component X/Y/Z/W reads.
+std::array<uint32_t, 4> HostSwizzle(xenos::TextureFormat format) {
+  switch (format) {
+    case xenos::TextureFormat::k_8:
+    case xenos::TextureFormat::k_8_A:
+    case xenos::TextureFormat::k_8_B:
+    case xenos::TextureFormat::k_16:
+    case xenos::TextureFormat::k_16_FLOAT:
+    case xenos::TextureFormat::k_32_FLOAT:
+    case xenos::TextureFormat::k_24_8:
+    case xenos::TextureFormat::k_24_8_FLOAT: return {0, 0, 0, 0};
+    case xenos::TextureFormat::k_8_8:
+    case xenos::TextureFormat::k_16_16:
+    case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_32_32_FLOAT:
+    case xenos::TextureFormat::k_DXN: return {0, 1, 1, 1};
+    default: return {0, 1, 2, 3};
+  }
+}
+
+// Fetch swizzle (3 bits per component: 0-3 = X..W, 4 = 0, 5 = 1) composed
+// with the host channel layout.
+uint32_t ComposeSwizzle(uint32_t fetch_swizzle, xenos::TextureFormat format) {
+  std::array<uint32_t, 4> host = HostSwizzle(format);
+  uint32_t out = 0;
+  for (uint32_t c = 0; c < 4; ++c) {
+    uint32_t s = (fetch_swizzle >> (3 * c)) & 7;
+    out |= (s < 4 ? host[s] : s) << (3 * c);
+  }
+  return out;
+}
+
+void HashSamples(XXH3_state_t& state, const uint8_t* data, uint32_t size, bool full);
+
+struct GuestTextureEntry {
+  dl::RefCntAutoPtr<dl::ITexture> texture;
+  uint64_t content_hash = 0;
+  uint64_t checked_frame = UINT64_MAX;
+  uint64_t bytes = 0;
+  // Content changed after the first upload (e.g. a glyph cache): checked at
+  // every use instead of once per frame.
+  bool dynamic = false;
+  // Guest memory the content hash covers (cached: the layout maths is costly).
+  uint32_t hash_ranges[4] = {};
+  bool hash_full = false;
+  bool ranges_valid = false;
+};
+
+uint64_t HashRanges(const uint8_t* base, const GuestTextureEntry& e) {
+  XXH3_state_t state;
+  XXH3_64bits_reset(&state);
+  for (int i = 0; i < 4; i += 2) {
+    uint32_t address = e.hash_ranges[i], size = e.hash_ranges[i + 1];
+    if (!size || address >= guest::kPhysicalMemorySize) continue;
+    size = std::min(size, guest::kPhysicalMemorySize - address);
+    HashSamples(state, guest::PhysicalPtr(base, address), size, e.hash_full);
+  }
+  return XXH3_64bits_digest(&state);
+}
+
+constexpr uint64_t kUnusedFrames = 1800;
+
+// Cheap change detection: the first 64 bytes of every 4 KB page.
+// Textures up to 1 MB are hashed whole: Tron's UI glyph cache gets new glyphs
+// written anywhere in a page, which the sampled hash misses.
+void HashSamples(XXH3_state_t& state, const uint8_t* data, uint32_t size, bool full) {
+  if (full && size <= (1u << 20)) {
+    XXH3_64bits_update(&state, data, size);
+    return;
+  }
+  for (uint32_t offset = 0; offset < size; offset += 4096) {
+    XXH3_64bits_update(&state, data + offset, std::min<uint32_t>(64, size - offset));
+  }
+}
+
+inline void SwapBlock(xenos::Endian endian, uint8_t* dst, const uint8_t* src, uint32_t bytes) {
+  switch (endian) {
+    case xenos::Endian::k8in16:
+      for (uint32_t i = 0; i < bytes; i += 2) {
+        uint16_t v;
+        std::memcpy(&v, src + i, 2);
+        v = __builtin_bswap16(v);
+        std::memcpy(dst + i, &v, 2);
+      }
+      break;
+    case xenos::Endian::k8in32:
+      for (uint32_t i = 0; i < bytes; i += 4) {
+        uint32_t v;
+        std::memcpy(&v, src + i, 4);
+        v = __builtin_bswap32(v);
+        std::memcpy(dst + i, &v, 4);
+      }
+      break;
+    case xenos::Endian::k16in32:
+      for (uint32_t i = 0; i < bytes; i += 4) {
+        uint32_t v;
+        std::memcpy(&v, src + i, 4);
+        v = (v >> 16) | (v << 16);
+        std::memcpy(dst + i, &v, 4);
+      }
+      break;
+    default:
+      std::memcpy(dst, src, bytes);
+      break;
+  }
+}
+
+uint64_t SampleHash(const uint8_t* data, uint32_t size) {
+  XXH3_state_t state;
+  XXH3_64bits_reset(&state);
+  HashSamples(state, data, size, false);
+  return XXH3_64bits_digest(&state);
+}
+
+// texture_util::GetTiledOffset2D, inlined for the per-block loop. pitch is
+// already aligned to 32 blocks.
+inline uint32_t TiledOffset2D(uint32_t x, uint32_t y, uint32_t pitch_tiles, uint32_t bpb_log2) {
+  int32_t macro = int32_t(((x >> 5) + (y >> 5) * pitch_tiles) << (bpb_log2 + 7));
+  int32_t micro = int32_t(((x & 7) + ((y & 0xE) << 2)) << bpb_log2);
+  int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + int32_t((y & 1) << 4);
+  return uint32_t(((offset & ~0x1FF) << 3) + int32_t((y & 16) << 7) + ((offset & 0x1C0) << 2) +
+                  int32_t(((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F));
+}
+
+// Copies one tiled level's blocks into a linear buffer (no byte swap);
+// false when part of it lies outside guest memory (the caller then copies
+// block by block).
+template <uint32_t kBpb>
+void DetileBlocks(uint8_t* dst, const uint8_t* src, uint32_t blocks_x, uint32_t blocks_y,
+                  uint32_t ox, uint32_t oy, uint32_t pitch_tiles, uint32_t bpb_log2) {
+  for (uint32_t y = 0; y < blocks_y; ++y) {
+    uint8_t* row = dst + size_t(y) * blocks_x * kBpb;
+    for (uint32_t x = 0; x < blocks_x; ++x) {
+      std::memcpy(row + size_t(x) * kBpb, src + TiledOffset2D(x + ox, y + oy, pitch_tiles, bpb_log2),
+                  kBpb);
+    }
+  }
+}
+
+uint32_t Log2BytesPerBlock(uint32_t bpb) {
+  return bpb >= 16 ? 4 : bpb >= 8 ? 3 : bpb >= 4 ? 2 : bpb >= 2 ? 1 : 0;
+}
+
+}  // namespace
+
+struct TextureCache::Impl {
+  dl::IRenderDevice* device;
+  dl::IDeviceContext* context;
+  ResolveLookup resolve_lookup;
+  Replacer replacer;
+  // Key: XXH3 of the fetch dwords identifying the texture data.
+  std::unordered_map<uint64_t, GuestTextureEntry> textures;
+  std::unordered_map<uint64_t, dl::RefCntAutoPtr<dl::ITextureView>> views;
+  std::unordered_map<uint64_t, dl::RefCntAutoPtr<dl::ISampler>> samplers;
+  std::set<uint32_t> reported_formats;
+  std::vector<uint8_t> staging;
+  uint32_t uploads = 0, resolved_hits = 0, unsupported = 0;
+  uint64_t uploaded_bytes = 0;
+  uint64_t last_frame = 0;
+  uint64_t evicted = 0;
+
+  void Evict(uint64_t frame, uint64_t unused_frames) {
+    std::unordered_set<dl::ITexture*> gone;
+    for (auto it = textures.begin(); it != textures.end();) {
+      const GuestTextureEntry& e = it->second;
+      if (e.checked_frame != frame &&
+          (e.checked_frame == UINT64_MAX || e.checked_frame + unused_frames <= frame)) {
+        if (e.texture) gone.insert(e.texture.RawPtr());
+        it = textures.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (gone.empty()) return;
+    for (auto it = views.begin(); it != views.end();) {
+      it = gone.count(it->second->GetTexture()) ? views.erase(it) : std::next(it);
+    }
+    evicted += gone.size();
+  }
+
+  void BeginUse(uint64_t frame) {
+    if (frame == last_frame) return;
+    last_frame = frame;
+    if (frame % 60 == 0) Evict(frame, kUnusedFrames);
+  }
+
+  // format: view format for typeless textures (UNKNOWN = the texture's own).
+  dl::ITextureView* View(dl::ITexture* texture, uint32_t swizzle,
+                         dl::RESOURCE_DIMENSION dimension = dl::RESOURCE_DIM_TEX_2D_ARRAY,
+                         dl::TEXTURE_FORMAT format = dl::TEX_FORMAT_UNKNOWN) {
+    uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(texture)) ^ (uint64_t(swizzle) << 52) ^
+                   (uint64_t(format) << 44);
+    auto it = views.find(key);
+    if (it != views.end()) return it->second;
+    dl::TextureViewDesc desc;
+    desc.ViewType = dl::TEXTURE_VIEW_SHADER_RESOURCE;
+    desc.TextureDim = dimension;
+    desc.Format = format;
+    desc.Swizzle = ComponentMapping(swizzle);
+    dl::RefCntAutoPtr<dl::ITextureView> view;
+    texture->CreateView(desc, &view);
+    if (!view) return nullptr;
+    views.emplace(key, view);
+    return view;
+  }
+
+  // All stored levels (0..levels-1) of every array slice, in DiligentCore
+  // subresource order (slice-major). Uses the SDK guest layout: level 0 from
+  // the base address, levels 1+ from the mip address, levels at or past the
+  // packed level from inside the packed mip tail.
+  struct LoadedLevels {
+    std::vector<uint8_t> data;
+    std::vector<dl::TextureSubResData> subresources;
+    uint32_t width = 0, height = 0, array_size = 1, levels = 1;
+  };
+  bool LoadLevels(const xenos::xe_gpu_texture_fetch_t& fetch, const HostFormat& host,
+                  const uint8_t* base, LoadedLevels& out, uint64_t& content_hash,
+                  bool hash_only = false, GuestTextureEntry* ranges_out = nullptr) {
+    uint32_t width_m1, height_m1, depth_m1, base_page, mip_page, mip_min, mip_max;
+    rg::texture_util::GetSubresourcesFromFetchConstant(fetch, &width_m1, &height_m1, &depth_m1,
+                                                       &base_page, &mip_page, &mip_min, &mip_max);
+    if (!base_page) return false;  // no base level (mip-only textures are rare)
+    auto format = xenos::TextureFormat(fetch.format);
+    const rg::FormatInfo* format_info = rg::FormatInfo::Get(format);
+    uint32_t bw = format_info->block_width, bh = format_info->block_height;
+    uint32_t bpb = host.bytes_per_block;
+    uint32_t bpb_log2 = Log2BytesPerBlock(bpb);
+    uint32_t width = width_m1 + 1, height = height_m1 + 1, array_size = depth_m1 + 1;
+    uint32_t max_level = mip_page ? mip_max : 0;
+    auto dimension = xenos::DataDimension(fetch.dimension);
+    auto layout = rg::texture_util::GetGuestTextureLayout(dimension, fetch.pitch, width, height,
+                                                          array_size, fetch.tiled, format,
+                                                          fetch.packed_mips, true, max_level);
+    uint32_t base_address = base_page << 12, mip_address = mip_page << 12;
+
+    // Content hash: sampled over the base and mip data; whole for small 8-bit
+    // textures (Tron's UI glyph cache writes glyphs anywhere in a page).
+    {
+      GuestTextureEntry ranges;
+      ranges.hash_ranges[0] = base_address;
+      ranges.hash_ranges[1] = layout.base.level_data_extent_bytes;
+      ranges.hash_ranges[2] = max_level ? mip_address : 0;
+      ranges.hash_ranges[3] = max_level ? layout.mips_total_extent_bytes : 0;
+      ranges.hash_full = format == xenos::TextureFormat::k_8 ||
+                         format == xenos::TextureFormat::k_8_A ||
+                         format == xenos::TextureFormat::k_8_B;
+      content_hash = HashRanges(base, ranges);
+      if (ranges_out) {
+        std::memcpy(ranges_out->hash_ranges, ranges.hash_ranges, sizeof(ranges.hash_ranges));
+        ranges_out->hash_full = ranges.hash_full;
+        ranges_out->ranges_valid = true;
+      }
+    }
+    if (hash_only) return true;
+
+    out.width = width;
+    out.height = height;
+    out.array_size = array_size;
+    out.levels = max_level + 1;
+    std::vector<size_t> offsets;
+    size_t total = 0;
+    for (uint32_t slice = 0; slice < array_size; ++slice) {
+      for (uint32_t level = 0; level <= max_level; ++level) {
+        uint32_t lw = std::max(width >> level, 1u), lh = std::max(height >> level, 1u);
+        offsets.push_back(total);
+        total += size_t((lw + bw - 1) / bw) * ((lh + bh - 1) / bh) * bpb;
+      }
+    }
+    out.data.assign(total, 0);
+    out.subresources.clear();
+    size_t index = 0;
+    for (uint32_t slice = 0; slice < array_size; ++slice) {
+      for (uint32_t level = 0; level <= max_level; ++level, ++index) {
+        uint32_t lw = std::max(width >> level, 1u), lh = std::max(height >> level, 1u);
+        uint32_t blocks_x = (lw + bw - 1) / bw, blocks_y = (lh + bh - 1) / bh;
+        bool is_base = level == 0;
+        uint32_t stored = std::min(level, layout.packed_level);
+        const auto& storage = is_base ? layout.base : layout.mips[stored];
+        uint32_t address = is_base ? base_address : mip_address + layout.mip_offsets_bytes[stored];
+        address += slice * storage.array_slice_stride_bytes;
+        uint32_t ox = 0, oy = 0, oz = 0;
+        if (level >= layout.packed_level) {
+          rg::texture_util::GetPackedMipOffset(width, height, 1, format, level, ox, oy, oz);
+        }
+        uint32_t pitch_bytes = storage.row_pitch_bytes;
+        uint8_t* dst = out.data.data() + offsets[index];
+        auto endian = xenos::Endian(fetch.endianness);
+        // Fast path: a tiled level wholly inside guest memory, copied block by
+        // block with the offset math inlined, then byte-swapped in one pass.
+        if (fetch.tiled && (bpb == 4 || bpb == 8 || bpb == 16)) {
+          const uint32_t pitch_blocks = pitch_bytes / bpb;
+          const uint32_t pitch_tiles = ((pitch_blocks + 31) & ~31u) >> 5;
+          const uint32_t rows = ((blocks_y + oy + 31) & ~31u);
+          const uint64_t extent = uint64_t(rows) * ((pitch_blocks + 31) & ~31u) * bpb;
+          if (address < guest::kPhysicalMemorySize && guest::kPhysicalMemorySize - address >= extent) {
+            const uint8_t* src = guest::PhysicalPtr(base, address);
+            if (bpb == 4) DetileBlocks<4>(dst, src, blocks_x, blocks_y, ox, oy, pitch_tiles, bpb_log2);
+            else if (bpb == 8) DetileBlocks<8>(dst, src, blocks_x, blocks_y, ox, oy, pitch_tiles, bpb_log2);
+            else DetileBlocks<16>(dst, src, blocks_x, blocks_y, ox, oy, pitch_tiles, bpb_log2);
+            if (endian != xenos::Endian::kNone) {
+              rg::texture_conversion::CopySwapBlock(endian, dst, dst, size_t(blocks_x) * blocks_y * bpb);
+            }
+            out.subresources.push_back(dl::TextureSubResData{dst, uint64_t(blocks_x) * bpb});
+            continue;
+          }
+        }
+        for (uint32_t y = 0; y < blocks_y; ++y) {
+          if (!fetch.tiled) {
+            uint32_t row = address + (y + oy) * pitch_bytes + ox * bpb;
+            uint32_t row_bytes = blocks_x * bpb;
+            if (row < guest::kPhysicalMemorySize &&
+                guest::kPhysicalMemorySize - row >= row_bytes) {
+              rg::texture_conversion::CopySwapBlock(endian, dst + size_t(y) * row_bytes,
+                                                    guest::PhysicalPtr(base, row), row_bytes);
+              continue;
+            }
+          }
+          for (uint32_t x = 0; x < blocks_x; ++x) {
+            uint32_t in = fetch.tiled
+                              ? uint32_t(rg::texture_util::GetTiledOffset2D(
+                                    int32_t(x + ox), int32_t(y + oy), pitch_bytes / bpb, bpb_log2))
+                              : (y + oy) * pitch_bytes + (x + ox) * bpb;
+            uint32_t source = address + in;
+            if (source >= guest::kPhysicalMemorySize || guest::kPhysicalMemorySize - source < bpb)
+              continue;
+            SwapBlock(endian, dst + (size_t(y) * blocks_x + x) * bpb,
+                      guest::PhysicalPtr(base, source), bpb);
+          }
+        }
+        out.subresources.push_back(dl::TextureSubResData{dst, uint64_t(blocks_x) * bpb});
+      }
+    }
+    return true;
+  }
+
+  // Creates or updates a texture with every loaded subresource.
+  bool StoreLevels(GuestTextureEntry& entry, const LoadedLevels& levels, const HostFormat& host,
+                   dl::RESOURCE_DIMENSION type, const char* name) {
+    if (!entry.texture) {
+      dl::TextureDesc desc;
+      desc.Name = name;
+      desc.Type = type;
+      desc.Width = levels.width;
+      desc.Height = levels.height;
+      desc.ArraySize = levels.array_size;
+      desc.MipLevels = levels.levels;
+      desc.Format = host.typeless != dl::TEX_FORMAT_UNKNOWN ? host.typeless : host.format;
+      desc.BindFlags = dl::BIND_SHADER_RESOURCE;
+      desc.Usage = dl::USAGE_DEFAULT;
+      dl::TextureData data{const_cast<dl::TextureSubResData*>(levels.subresources.data()),
+                           uint32_t(levels.subresources.size())};
+      device->CreateTexture(desc, &data, &entry.texture);
+      if (!entry.texture) {
+        Evict(last_frame, 1);
+        device->CreateTexture(desc, &data, &entry.texture);
+      }
+      if (!entry.texture) return false;
+      entry.bytes = levels.data.size();
+    } else {
+      size_t index = 0;
+      for (uint32_t slice = 0; slice < levels.array_size; ++slice) {
+        for (uint32_t level = 0; level < levels.levels; ++level, ++index) {
+          dl::Box box(0, std::max(levels.width >> level, 1u), 0,
+                      std::max(levels.height >> level, 1u));
+          context->UpdateTexture(entry.texture, level, slice, box, levels.subresources[index],
+                                 dl::RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
+                                 dl::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+        }
+      }
+    }
+    ++uploads;
+    uploaded_bytes += levels.data.size();
+    return true;
+  }
+};
+
+TextureCache::TextureCache(dl::IRenderDevice* device, dl::IDeviceContext* context,
+                           ResolveLookup resolve_lookup)
+    : impl_(std::make_unique<Impl>()) {
+  impl_->device = device;
+  impl_->context = context;
+  impl_->resolve_lookup = std::move(resolve_lookup);
+}
+
+TextureCache::~TextureCache() = default;
+
+void TextureCache::SetReplacer(Replacer replacer) { impl_->replacer = std::move(replacer); }
+
+namespace {
+struct FrameView {
+  uint32_t dwords[6];
+  bool is_signed;
+  uint64_t frame;
+  dl::ITextureView* view;
+  char source;
+};
+std::unordered_map<uint64_t, FrameView> g_frame_views;
+uint64_t g_frame_views_frame = UINT64_MAX;
+bool g_last_view_dynamic = false;
+}  // namespace
+
+void TextureCache::InvalidateFrameViews() { g_frame_views.clear(); }
+uint32_t TextureCache::UploadCount() const { return impl_->uploads; }
+
+dl::ITextureView* TextureCache::GetView2D(const uint32_t fetch_dwords[6], const uint8_t* base,
+                                          uint64_t frame, char* source, bool is_signed) {
+  if (frame != g_frame_views_frame) {
+    g_frame_views.clear();
+    g_frame_views_frame = frame;
+  }
+  uint64_t key = XXH3_64bits(fetch_dwords, 6 * sizeof(uint32_t)) ^ (is_signed ? 0x5151ull : 0);
+  auto it = g_frame_views.find(key);
+  if (it != g_frame_views.end() && it->second.is_signed == is_signed &&
+      std::memcmp(it->second.dwords, fetch_dwords, sizeof(it->second.dwords)) == 0) {
+    if (source) *source = it->second.source;
+    return it->second.view;
+  }
+  char src = '-';
+  g_last_view_dynamic = false;
+  dl::ITextureView* view = GetView2DImpl(fetch_dwords, base, frame, &src, is_signed);
+  if (source) *source = src;
+  // Textures that change mid-frame (UI glyph cache) are checked at every use.
+  if (view && !g_last_view_dynamic) {
+    FrameView& e = g_frame_views[key];
+    std::memcpy(e.dwords, fetch_dwords, sizeof(e.dwords));
+    e.is_signed = is_signed;
+    e.frame = frame;
+    e.view = view;
+    e.source = src;
+  }
+  return view;
+}
+
+dl::ITextureView* TextureCache::GetView2DImpl(const uint32_t fetch_dwords[6], const uint8_t* base,
+                                          uint64_t frame, char* source, bool is_signed) {
+  Impl& m = *impl_;
+  char unused;
+  char& src_kind = source ? *source : unused;
+  src_kind = '-';
+  xenos::xe_gpu_texture_fetch_t fetch;
+  std::memcpy(&fetch, fetch_dwords, sizeof(fetch));
+  if (fetch.type != xenos::FetchConstantType::kTexture) return nullptr;
+  rg::TextureInfo info;
+  if (!PrepareTextureInfoCached(fetch, &info)) return nullptr;
+  if (info.dimension != xenos::DataDimension::k2DOrStacked &&
+      info.dimension != xenos::DataDimension::k1D) {
+    return nullptr;
+  }
+  uint32_t swizzle = ComposeSwizzle(fetch.swizzle, info.format);
+  uint32_t address = info.memory.base_address;
+  // TextureInfo keeps the fetch encoding (size - 1).
+  uint32_t width = info.width + 1;
+  uint32_t height = info.height + 1;
+
+  // Rendered textures: the native resolve output.
+  bool rb_swap = false;
+  if (dl::ITexture* resolved =
+          m.resolve_lookup(address, width, height, uint32_t(info.format), rb_swap)) {
+    ++m.resolved_hits;
+    src_kind = 'R';
+    if (rb_swap) swizzle = SwapRedBlueSwizzle(swizzle);
+    return m.View(resolved, swizzle);
+  }
+
+  HostFormat host;
+  if (!GetHostFormat(info.format, host) ||
+      info.format_info()->bytes_per_block() != host.bytes_per_block) {
+    if (m.reported_formats.insert(uint32_t(info.format)).second) {
+      REXLOG_INFO("NATIVE-TEX unsupported guest format {} ({}x{})", uint32_t(info.format), width,
+                  height);
+    }
+    ++m.unsupported;
+    return nullptr;
+  }
+  uint32_t size = info.extent.all_blocks() * host.bytes_per_block;
+  if (!guest::IsPhysicalRange(address, size)) return nullptr;
+
+  // The texture is identified by its address, format, size and mip setup.
+  // (dword 0: pitch and tiling; 1: base and format; 2: size; 5: mip address).
+  uint32_t identity[5] = {fetch_dwords[0] & 0xFFC00000u, fetch_dwords[1], fetch_dwords[2],
+                          fetch_dwords[5],
+                          (uint32_t(fetch.mip_min_level) << 4) | uint32_t(fetch.mip_max_level)};
+  uint64_t key = XXH3_64bits(identity, sizeof(identity));
+  m.BeginUse(frame);
+  GuestTextureEntry& entry = m.textures[key];
+  src_kind = 'U';
+  if (is_signed && host.snorm == dl::TEX_FORMAT_UNKNOWN) {
+    src_kind = '0';  // no signed host format: the fetch reads zero
+    return nullptr;
+  }
+  dl::TEXTURE_FORMAT view_format = is_signed ? host.snorm : host.format;
+  auto view = [&](const LoadedTexture* loaded) {
+    if (m.replacer && !is_signed) {
+      if (dl::ITexture* replacement = m.replacer(entry.content_hash, loaded)) {
+        return m.View(replacement, swizzle, dl::RESOURCE_DIM_TEX_2D_ARRAY);
+      }
+    }
+    return m.View(entry.texture, swizzle, dl::RESOURCE_DIM_TEX_2D_ARRAY, view_format);
+  };
+  g_last_view_dynamic = entry.dynamic;
+  if (entry.texture && entry.checked_frame == frame && !entry.dynamic) return view(nullptr);
+  entry.checked_frame = frame;
+  Impl::LoadedLevels levels;
+  uint64_t hash = 0;
+  if (entry.texture && entry.ranges_valid) {
+    hash = HashRanges(base, entry);
+  } else if (!m.LoadLevels(fetch, host, base, levels, hash, true, &entry)) {
+    m.textures.erase(key);
+    return nullptr;
+  }
+  if (entry.texture && entry.content_hash == hash) return view(nullptr);
+  if (entry.texture && size <= (1u << 20)) entry.dynamic = true;
+  g_last_view_dynamic = entry.dynamic;
+  entry.content_hash = hash;
+  const uint64_t load_start = __builtin_ia32_rdtsc();
+  m.LoadLevels(fetch, host, base, levels, hash);
+  g_tex_load_ticks.fetch_add(__builtin_ia32_rdtsc() - load_start, std::memory_order_relaxed);
+#if defined(__PROSPERO__)
+  // Match the game's shared Minion Pro coverage atlas by content. Adjust its
+  // antialiased edges at upload while keeping its glyph geometry and color.
+  constexpr uint32_t kFontWidth = 512, kFontHeight = 256;
+  constexpr uint64_t kFontHash = 0x572E39128764CC1Full;
+  constexpr uint64_t kFontSeed = kFontWidth | (uint64_t(kFontHeight) << 16) |
+                                 (uint64_t(xenos::TextureFormat::k_8_A) << 32);
+  std::vector<uint8_t> sharper_font;
+  const void* original_font = nullptr;
+  if (info.format == xenos::TextureFormat::k_8_A && levels.width == kFontWidth &&
+      levels.height == kFontHeight && levels.subresources.size() == 1 &&
+      levels.subresources[0].Stride == kFontWidth &&
+      XXH3_64bits_withSeed(levels.subresources[0].pData, kFontWidth * kFontHeight, kFontSeed) ==
+          kFontHash) {
+    const auto* coverage = static_cast<const uint8_t*>(levels.subresources[0].pData);
+    sharper_font.resize(kFontWidth * kFontHeight);
+    std::transform(coverage, coverage + sharper_font.size(), sharper_font.begin(),
+                   [](uint8_t alpha) {
+                     return uint8_t(std::clamp((5 * int(alpha) - 128) / 4, 0, 255));
+                   });
+    original_font = coverage;
+    levels.subresources[0].pData = sharper_font.data();
+    REXLOG_INFO("NATIVE-TEX: sharpened the Minion Pro font atlas");
+  }
+#endif
+  const uint64_t store_start = __builtin_ia32_rdtsc();
+  const bool stored = m.StoreLevels(entry, levels, host, dl::RESOURCE_DIM_TEX_2D_ARRAY, "GuestTexture");
+  g_tex_store_ticks.fetch_add(__builtin_ia32_rdtsc() - store_start, std::memory_order_relaxed);
+  if (!stored) {
+    m.textures.erase(key);
+    return nullptr;
+  }
+#if defined(__PROSPERO__)
+  // Keep texture mod lookup keyed to the unmodified game data.
+  if (original_font) levels.subresources[0].pData = original_font;
+#endif
+  LoadedTexture loaded{levels.width, levels.height, uint32_t(info.format), levels.levels,
+                       levels.subresources.empty()
+                           ? nullptr
+                           : static_cast<const uint8_t*>(levels.subresources[0].pData)};
+  return view(&loaded);
+}
+
+dl::ITextureView* TextureCache::GetViewCube(const uint32_t fetch_dwords[6], const uint8_t* base,
+                                            uint64_t frame, char* source, bool is_signed) {
+  Impl& m = *impl_;
+  char unused;
+  char& src_kind = source ? *source : unused;
+  src_kind = '-';
+  xenos::xe_gpu_texture_fetch_t fetch;
+  std::memcpy(&fetch, fetch_dwords, sizeof(fetch));
+  if (fetch.type != xenos::FetchConstantType::kTexture) return nullptr;
+  rg::TextureInfo info;
+  if (!PrepareTextureInfoCached(fetch, &info) || info.dimension != xenos::DataDimension::kCube) {
+    return nullptr;
+  }
+  HostFormat host;
+  if (!GetHostFormat(info.format, host) ||
+      info.format_info()->bytes_per_block() != host.bytes_per_block) {
+    if (m.reported_formats.insert(0x200 | uint32_t(info.format)).second) {
+      REXLOG_INFO("NATIVE-TEX unsupported cube guest format {}", uint32_t(info.format));
+    }
+    return nullptr;
+  }
+  uint32_t width = info.width + 1, height = info.height + 1;
+  const auto& extent = info.extent;
+  // Faces are consecutive slices, each aligned to 4 KB.
+  uint32_t face_stride =
+      (extent.block_pitch_h * extent.block_pitch_v * host.bytes_per_block + 4095) & ~4095u;
+  uint32_t address = info.memory.base_address;
+  uint32_t size = face_stride * 6;
+  if (!guest::IsPhysicalRange(address, size)) return nullptr;
+  uint32_t swizzle = ComposeSwizzle(fetch.swizzle, info.format);
+
+  // Cube and 3D keys: the whole fetch constant, xored apart from each other.
+  uint64_t key = XXH3_64bits(fetch_dwords, 6 * sizeof(uint32_t)) ^ 0xC0BEC0BEull;
+  m.BeginUse(frame);
+  GuestTextureEntry& entry = m.textures[key];
+  src_kind = 'U';
+  if (is_signed && host.snorm == dl::TEX_FORMAT_UNKNOWN) {
+    src_kind = '0';
+    return nullptr;
+  }
+  dl::TEXTURE_FORMAT view_format = is_signed ? host.snorm : host.format;
+  if (entry.texture && entry.checked_frame == frame) {
+    return m.View(entry.texture, swizzle, dl::RESOURCE_DIM_TEX_CUBE, view_format);
+  }
+  entry.checked_frame = frame;
+  Impl::LoadedLevels levels;
+  uint64_t hash = 0;
+  if (!m.LoadLevels(fetch, host, base, levels, hash, true)) {
+    m.textures.erase(key);
+    return nullptr;
+  }
+  if (entry.texture && entry.content_hash == hash) {
+    return m.View(entry.texture, swizzle, dl::RESOURCE_DIM_TEX_CUBE, view_format);
+  }
+  entry.content_hash = hash;
+  m.LoadLevels(fetch, host, base, levels, hash);
+  if (levels.array_size != 6) return nullptr;
+  bool created = !entry.texture;
+  if (!m.StoreLevels(entry, levels, host, dl::RESOURCE_DIM_TEX_CUBE, "GuestTextureCube")) {
+    m.textures.erase(key);
+    return nullptr;
+  }
+  if (created) {
+    REXLOG_INFO("NATIVE-TEX cube texture {:08X} {}x{} fmt={} levels={}", address, width, height,
+                uint32_t(info.format), levels.levels);
+  }
+  return m.View(entry.texture, swizzle, dl::RESOURCE_DIM_TEX_CUBE, view_format);
+}
+
+dl::ITextureView* TextureCache::GetView3D(const uint32_t fetch_dwords[6], const uint8_t* base,
+                                          uint64_t frame, char* source, bool is_signed) {
+  Impl& m = *impl_;
+  char unused;
+  char& src_kind = source ? *source : unused;
+  src_kind = '-';
+  xenos::xe_gpu_texture_fetch_t fetch;
+  std::memcpy(&fetch, fetch_dwords, sizeof(fetch));
+  if (fetch.type != xenos::FetchConstantType::kTexture) return nullptr;
+  rg::TextureInfo info;
+  if (!PrepareTextureInfoCached(fetch, &info) || info.dimension != xenos::DataDimension::k3D) {
+    return nullptr;
+  }
+  HostFormat host;
+  if (!GetHostFormat(info.format, host) ||
+      info.format_info()->bytes_per_block() != host.bytes_per_block ||
+      info.format_info()->block_width != 1) {
+    if (m.reported_formats.insert(0x100 | uint32_t(info.format)).second) {
+      REXLOG_INFO("NATIVE-TEX unsupported 3D guest format {}", uint32_t(info.format));
+    }
+    return nullptr;
+  }
+  uint32_t width = info.width + 1, height = info.height + 1, depth = info.depth + 1;
+  const auto& extent = info.extent;
+  uint32_t pitch = extent.block_pitch_h, pitch_v = extent.block_pitch_v;
+  uint32_t address = info.memory.base_address;
+  uint32_t size = pitch * pitch_v * depth * host.bytes_per_block;
+  if (!guest::IsPhysicalRange(address, size)) return nullptr;
+  const uint8_t* src = guest::PhysicalPtr(base, address);
+  uint32_t swizzle = ComposeSwizzle(fetch.swizzle, info.format);
+
+  uint64_t key = XXH3_64bits(fetch_dwords, 6 * sizeof(uint32_t)) ^ 0x3D3D3D3Dull;
+  m.BeginUse(frame);
+  GuestTextureEntry& entry = m.textures[key];
+  src_kind = 'U';
+  if (is_signed && host.snorm == dl::TEX_FORMAT_UNKNOWN) {
+    src_kind = '0';
+    return nullptr;
+  }
+  dl::TEXTURE_FORMAT view_format = is_signed ? host.snorm : host.format;
+  if (entry.texture && entry.checked_frame == frame) {
+    return m.View(entry.texture, swizzle, dl::RESOURCE_DIM_TEX_3D, view_format);
+  }
+  uint64_t hash = SampleHash(src, size);
+  entry.checked_frame = frame;
+  if (entry.texture && entry.content_hash == hash) {
+    return m.View(entry.texture, swizzle, dl::RESOURCE_DIM_TEX_3D, view_format);
+  }
+  entry.content_hash = hash;
+
+  uint32_t bpb = host.bytes_per_block;
+  uint32_t bpb_log2 = Log2BytesPerBlock(bpb);
+  m.staging.assign(size_t(width) * height * depth * bpb, 0);
+  for (uint32_t z = 0; z < depth; ++z) {
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        size_t in = info.is_tiled
+                        ? size_t(rg::texture_util::GetTiledOffset3D(
+                              int32_t(x), int32_t(y), int32_t(z), pitch, pitch_v, bpb_log2))
+                        : ((size_t(z) * pitch_v + y) * pitch + x) * bpb;
+        if (in + bpb > size) continue;
+        rg::texture_conversion::CopySwapBlock(
+            info.endianness, &m.staging[((size_t(z) * height + y) * width + x) * bpb], src + in,
+            bpb);
+      }
+    }
+  }
+  dl::TextureSubResData subresource{m.staging.data(), uint64_t(width) * bpb};
+  subresource.DepthStride = uint64_t(width) * height * bpb;
+  if (!entry.texture) {
+    dl::TextureDesc desc;
+    desc.Name = "GuestTexture3D";
+    desc.Type = dl::RESOURCE_DIM_TEX_3D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.Depth = depth;
+    desc.MipLevels = 1;
+    desc.Format = host.typeless != dl::TEX_FORMAT_UNKNOWN ? host.typeless : host.format;
+    desc.BindFlags = dl::BIND_SHADER_RESOURCE;
+    desc.Usage = dl::USAGE_DEFAULT;
+    dl::TextureData data{&subresource, 1};
+    m.device->CreateTexture(desc, &data, &entry.texture);
+    if (!entry.texture) {
+      m.textures.erase(key);
+      return nullptr;
+    }
+    entry.bytes = m.staging.size();
+    REXLOG_INFO("NATIVE-TEX 3D texture {:08X} {}x{}x{} fmt={} tiled={}", address, width, height,
+                depth, uint32_t(info.format), info.is_tiled);
+  } else {
+    dl::Box box(0, width, 0, height, 0, depth);
+    m.context->UpdateTexture(entry.texture, 0, 0, box, subresource,
+                             dl::RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
+                             dl::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+  }
+  ++m.uploads;
+  m.uploaded_bytes += m.staging.size();
+  return m.View(entry.texture, swizzle, dl::RESOURCE_DIM_TEX_3D, view_format);
+}
+
+dl::ISampler* TextureCache::GetSampler(const uint32_t fetch_dwords[6], uint32_t mag_filter,
+                                       uint32_t min_filter, uint32_t mip_filter,
+                                       uint32_t aniso_filter) {
+  Impl& m = *impl_;
+  xenos::xe_gpu_texture_fetch_t fetch;
+  std::memcpy(&fetch, fetch_dwords, sizeof(fetch));
+  constexpr uint32_t kUseFetch = uint32_t(xenos::TextureFilter::kUseFetchConst);
+  if (mag_filter == kUseFetch) mag_filter = uint32_t(fetch.mag_filter);
+  if (min_filter == kUseFetch) min_filter = uint32_t(fetch.min_filter);
+  if (mip_filter == kUseFetch) mip_filter = uint32_t(fetch.mip_filter);
+  if (aniso_filter == uint32_t(xenos::AnisoFilter::kUseFetchConst)) {
+    aniso_filter = uint32_t(fetch.aniso_filter);
+  }
+  xenos::ClampMode clamp_x, clamp_y, clamp_z;
+  rg::texture_util::GetClampModesForDimension(fetch, clamp_x, clamp_y, clamp_z);
+  uint32_t mip_min = fetch.mip_min_level,
+           mip_max = std::max(fetch.mip_min_level, fetch.mip_max_level);
+  bool base_map = mip_filter == uint32_t(xenos::TextureFilter::kBaseMap);
+  // The anisotropic_override graphics option, applied as the SDK texture cache does.
+  static const int32_t aniso_override = rex::cvar::Query<int32_t>("anisotropic_override");
+  constexpr uint32_t kLinear = uint32_t(xenos::TextureFilter::kLinear);
+  if (aniso_override >= 0 && aniso_override < 6 && mip_max > mip_min && !base_map &&
+      mag_filter == kLinear && min_filter == kLinear &&
+      (mip_filter == uint32_t(xenos::TextureFilter::kPoint) || mip_filter == kLinear)) {
+    aniso_filter = uint32_t(aniso_override);
+  }
+  if (base_map) mip_min = mip_max = 0;
+  bool border = xenos::ClampModeUsesBorder(clamp_x) || xenos::ClampModeUsesBorder(clamp_y) ||
+                xenos::ClampModeUsesBorder(clamp_z);
+  uint32_t border_color = border ? uint32_t(fetch.border_color) : 0;
+  uint64_t key = mag_filter | (min_filter << 2) | (mip_filter << 4) | (aniso_filter << 6) |
+                 (uint32_t(clamp_x) << 9) | (uint32_t(clamp_y) << 12) | (uint32_t(clamp_z) << 15) |
+                 (uint64_t(mip_min) << 18) | (uint64_t(mip_max) << 22) |
+                 (uint64_t(border_color) << 26);
+  auto it = m.samplers.find(key);
+  if (it != m.samplers.end()) return it->second;
+
+  auto filter = [](uint32_t f) {
+    return f == uint32_t(xenos::TextureFilter::kLinear) ? dl::FILTER_TYPE_LINEAR
+                                                        : dl::FILTER_TYPE_POINT;
+  };
+  dl::SamplerDesc desc;
+  desc.MagFilter = filter(mag_filter);
+  desc.MinFilter = filter(min_filter);
+  desc.MipFilter = filter(mip_filter);
+  if (aniso_filter != uint32_t(xenos::AnisoFilter::kDisabled)) {
+    desc.MinFilter = desc.MagFilter = desc.MipFilter = dl::FILTER_TYPE_ANISOTROPIC;
+    desc.MaxAnisotropy = 1u << (std::min(aniso_filter, 5u) - 1);
+  }
+  desc.MinLOD = float(mip_min);
+  desc.MaxLOD = float(mip_max);
+  desc.AddressU = AddressMode(clamp_x);
+  desc.AddressV = AddressMode(clamp_y);
+  desc.AddressW = AddressMode(clamp_z);
+  if (border_color == uint32_t(xenos::BorderColor::k_ABGR_White)) {
+    desc.BorderColor[0] = desc.BorderColor[1] = desc.BorderColor[2] = desc.BorderColor[3] = 1.0f;
+  }
+  dl::RefCntAutoPtr<dl::ISampler> sampler;
+  m.device->CreateSampler(desc, &sampler);
+  if (!sampler) return nullptr;
+  m.samplers.emplace(key, sampler);
+  return sampler;
+}
+
+void TextureCache::LogStats() {
+  uint64_t bytes = 0;
+  for (const auto& [key, entry] : impl_->textures) bytes += entry.bytes;
+  REXLOG_INFO(
+      "NATIVE-TEX textures={} ({} MB) evicted={} uploads={} uploaded={} KB resolved_hits={} "
+      "unsupported={} views={} samplers={}",
+      impl_->textures.size(), bytes >> 20, impl_->evicted, impl_->uploads,
+      impl_->uploaded_bytes / 1024, impl_->resolved_hits, impl_->unsupported,
+      impl_->views.size(), impl_->samplers.size());
+}
+
+}  // namespace renderer

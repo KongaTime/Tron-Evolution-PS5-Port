@@ -1,0 +1,1210 @@
+#include "draw_renderer.h"
+
+#include "guest_gpu_state.h"
+#include "guest_memory.h"
+#include "pipeline_storage.h"
+#include "render_stats.h"
+#include "texture_cache.h"
+
+#include "Common/interface/RefCntAutoPtr.hpp"
+#include "Graphics/GraphicsEngine/interface/Buffer.h"
+#include "Graphics/GraphicsEngine/interface/BufferView.h"
+#include "Graphics/GraphicsEngine/interface/DeviceContext.h"
+#include "Graphics/GraphicsEngine/interface/PipelineState.h"
+#include "Graphics/GraphicsEngine/interface/PipelineStateCache.h"
+#include "Graphics/GraphicsEngine/interface/RenderDevice.h"
+#include "Graphics/GraphicsEngine/interface/Sampler.h"
+#include "Graphics/GraphicsEngine/interface/ShaderResourceBinding.h"
+#include "Graphics/GraphicsEngine/interface/Texture.h"
+#include "Graphics/GraphicsEngine/interface/TextureView.h"
+#include "Graphics/GraphicsTools/interface/MapHelper.hpp"
+
+#include <rex/cvar.h>
+#include <rex/graphics/pipeline/shader/spirv.h>
+#include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/util.h>
+#include <rex/graphics/register_file.h>
+#include <rex/graphics/registers.h>
+#include <rex/graphics/util/draw.h>
+#include <rex/graphics/xenos.h>
+#include <rex/logging/macros.h>
+
+#include <fmt/format.h>
+#include <xxhash.h>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <map>
+#include <set>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+REXCVAR_DEFINE_BOOL(dante_ui_16_9, true, "Graphics",
+                    "renderer=dante: draw menus and the HUD in a centred 16:9 area on wider "
+                    "screens instead of stretching them");
+
+namespace renderer {
+namespace {
+
+namespace dl = Diligent;
+namespace rg = rex::graphics;
+namespace reg = rex::graphics::reg;
+namespace xenos = rex::graphics::xenos;
+using Translator = rg::SpirvShaderTranslator;
+
+// 128 MB: a frame writes a few MB of indices, so the ring cannot wrap onto
+// indices the GPU is still reading for frames in flight.
+constexpr uint32_t kIndexRingSize = 128u * 1024 * 1024;
+
+void ConvertIndices16(const uint8_t* src, uint32_t count, bool swap, bool reset_enabled,
+                      uint16_t reset, uint16_t* out) {
+  std::memcpy(out, src, size_t(count) * 2);
+  if (swap) {
+    for (uint32_t i = 0; i < count; ++i) out[i] = uint16_t((out[i] << 8) | (out[i] >> 8));
+  }
+  if (reset_enabled) {
+    for (uint32_t i = 0; i < count; ++i) out[i] = out[i] == reset ? uint16_t(0xFFFF) : out[i];
+  }
+}
+
+void ConvertIndices32(const uint8_t* src, uint32_t count, xenos::Endian endian,
+                      bool reset_enabled, uint32_t reset, uint32_t* out) {
+  std::memcpy(out, src, size_t(count) * 4);
+  switch (endian) {
+    case xenos::Endian::k8in16:
+      for (uint32_t i = 0; i < count; ++i) {
+        out[i] = ((out[i] << 8) & 0xFF00FF00u) | ((out[i] >> 8) & 0x00FF00FFu);
+      }
+      break;
+    case xenos::Endian::k8in32:
+      for (uint32_t i = 0; i < count; ++i) out[i] = __builtin_bswap32(out[i]);
+      break;
+    case xenos::Endian::k16in32:
+      for (uint32_t i = 0; i < count; ++i) out[i] = (out[i] >> 16) | (out[i] << 16);
+      break;
+    default:
+      break;
+  }
+  if (reset_enabled) {
+    for (uint32_t i = 0; i < count; ++i) {
+      out[i] = (out[i] & 0xFFFFFF) == reset ? 0xFFFFFFFFu : out[i];
+    }
+  }
+}
+
+static_assert([] {
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < kStoredContextRanges; ++i) {
+    if (kShadowRanges[i].reg >= 0x4000) return false;
+    count += kShadowRanges[i].count;
+  }
+  return count == kStoredContextRegisters && kShadowRanges[kStoredContextRanges].reg >= 0x4000;
+}(), "GuestDrawState must hold exactly the context ranges of kShadowRanges");
+
+struct PipelineKeyHash {
+  size_t operator()(const PipelineKey& k) const { return XXH3_64bits(&k, sizeof(k)); }
+};
+
+dl::BLEND_FACTOR BlendFactor(xenos::BlendFactor f, bool alpha) {
+  switch (f) {
+    case xenos::BlendFactor::kZero: return dl::BLEND_FACTOR_ZERO;
+    case xenos::BlendFactor::kOne: return dl::BLEND_FACTOR_ONE;
+    case xenos::BlendFactor::kSrcColor:
+      return alpha ? dl::BLEND_FACTOR_SRC_ALPHA : dl::BLEND_FACTOR_SRC_COLOR;
+    case xenos::BlendFactor::kOneMinusSrcColor:
+      return alpha ? dl::BLEND_FACTOR_INV_SRC_ALPHA : dl::BLEND_FACTOR_INV_SRC_COLOR;
+    case xenos::BlendFactor::kSrcAlpha: return dl::BLEND_FACTOR_SRC_ALPHA;
+    case xenos::BlendFactor::kOneMinusSrcAlpha: return dl::BLEND_FACTOR_INV_SRC_ALPHA;
+    case xenos::BlendFactor::kDstColor:
+      return alpha ? dl::BLEND_FACTOR_DEST_ALPHA : dl::BLEND_FACTOR_DEST_COLOR;
+    case xenos::BlendFactor::kOneMinusDstColor:
+      return alpha ? dl::BLEND_FACTOR_INV_DEST_ALPHA : dl::BLEND_FACTOR_INV_DEST_COLOR;
+    case xenos::BlendFactor::kDstAlpha: return dl::BLEND_FACTOR_DEST_ALPHA;
+    case xenos::BlendFactor::kOneMinusDstAlpha: return dl::BLEND_FACTOR_INV_DEST_ALPHA;
+    case xenos::BlendFactor::kConstantColor:
+    case xenos::BlendFactor::kConstantAlpha: return dl::BLEND_FACTOR_BLEND_FACTOR;
+    case xenos::BlendFactor::kOneMinusConstantColor:
+    case xenos::BlendFactor::kOneMinusConstantAlpha: return dl::BLEND_FACTOR_INV_BLEND_FACTOR;
+    case xenos::BlendFactor::kSrcAlphaSaturate:
+      return alpha ? dl::BLEND_FACTOR_ONE : dl::BLEND_FACTOR_SRC_ALPHA_SAT;
+    default: return dl::BLEND_FACTOR_ONE;
+  }
+}
+
+dl::BLEND_OPERATION BlendOp(xenos::BlendOp op) {
+  switch (op) {
+    case xenos::BlendOp::kSubtract: return dl::BLEND_OPERATION_SUBTRACT;
+    case xenos::BlendOp::kMin: return dl::BLEND_OPERATION_MIN;
+    case xenos::BlendOp::kMax: return dl::BLEND_OPERATION_MAX;
+    case xenos::BlendOp::kRevSubtract: return dl::BLEND_OPERATION_REV_SUBTRACT;
+    default: return dl::BLEND_OPERATION_ADD;
+  }
+}
+
+dl::STENCIL_OP StencilOp(xenos::StencilOp op) {
+  switch (op) {
+    case xenos::StencilOp::kZero: return dl::STENCIL_OP_ZERO;
+    case xenos::StencilOp::kReplace: return dl::STENCIL_OP_REPLACE;
+    case xenos::StencilOp::kIncrementClamp: return dl::STENCIL_OP_INCR_SAT;
+    case xenos::StencilOp::kDecrementClamp: return dl::STENCIL_OP_DECR_SAT;
+    case xenos::StencilOp::kInvert: return dl::STENCIL_OP_INVERT;
+    case xenos::StencilOp::kIncrementWrap: return dl::STENCIL_OP_INCR_WRAP;
+    case xenos::StencilOp::kDecrementWrap: return dl::STENCIL_OP_DECR_WRAP;
+    default: return dl::STENCIL_OP_KEEP;
+  }
+}
+
+// xenos::CompareFunction (never..always = 0..7) -> COMPARISON_FUNCTION (1..8).
+dl::COMPARISON_FUNCTION Compare(xenos::CompareFunction f) {
+  return dl::COMPARISON_FUNCTION(uint32_t(f) + 1);
+}
+
+// Texture / sampler variables of a pipeline, parsed from the translator's
+// names: xe_texture{fc}_{2d|3d|cube}_{s|u}, xe_sampler{fc}_{mag}{min}{mip}[_a{N}].
+struct TextureVariable {
+  dl::IShaderResourceVariable* variable;
+  uint32_t fetch_constant;
+  char dimension;  // '2' (2D array), '3' (3D), 'c' (cube)
+  bool is_signed;  // translator binding for signed components (_s)
+  mutable dl::IDeviceObject* bound = nullptr;  // last object set (skip repeats)
+};
+struct SamplerVariable {
+  dl::IShaderResourceVariable* variable;
+  uint32_t fetch_constant;
+  uint32_t mag, min, mip, aniso;
+  mutable dl::IDeviceObject* bound = nullptr;
+};
+
+struct Pipeline {
+  dl::RefCntAutoPtr<dl::IPipelineState> pso;
+  dl::RefCntAutoPtr<dl::IShaderResourceBinding> srb;
+  std::vector<TextureVariable> textures;
+  std::vector<SamplerVariable> samplers;
+  uint32_t used_fetch_mask = 0;
+};
+
+bool ParseSamplerName(std::string_view name, SamplerVariable& out) {
+  size_t pos = name.find("xe_sampler");
+  if (pos == std::string_view::npos) return false;
+  pos += 10;
+  uint32_t fc = 0;
+  while (pos < name.size() && name[pos] >= '0' && name[pos] <= '9')
+    fc = fc * 10 + (name[pos++] - '0');
+  if (pos + 4 > name.size() || name[pos] != '_') return false;
+  auto filter = [](char c) -> uint32_t { return c == 'p' ? 0 : c == 'l' ? 1 : c == 'b' ? 2 : 3; };
+  out.fetch_constant = fc;
+  out.mag = filter(name[pos + 1]);
+  out.min = filter(name[pos + 2]);
+  out.mip = filter(name[pos + 3]);
+  out.aniso = 7;  // kUseFetchConst
+  pos += 4;
+  if (pos + 2 <= name.size() && name.substr(pos, 2) == "_a") {
+    uint32_t n = 0;
+    for (pos += 2; pos < name.size() && name[pos] >= '0' && name[pos] <= '9'; ++pos) {
+      n = n * 10 + (name[pos] - '0');
+    }
+    out.aniso = n ? uint32_t(__builtin_ctz(n)) + 1 : 0;
+  }
+  return true;
+}
+
+}  // namespace
+
+struct DrawRenderer::Impl {
+  dl::IShaderResourceBinding* last_srb = nullptr;
+  uint32_t last_uploads = 0;
+  bool bindings_dirty = true;
+  uint64_t commits_skipped = 0;
+  uint8_t* index_ring_cpu = nullptr;  // persistent mapping of index_ring (unified)
+  // Last contents written to each dynamic constant buffer this frame: a draw
+  // whose constants did not change skips the map (Tron: ~2500 draws a frame).
+  struct ConstantCache {
+    uint64_t frame = UINT64_MAX;
+    std::vector<uint8_t> bytes;
+  };
+  ConstantCache cache_float_vertex, cache_float_pixel, cache_bool_loop, cache_fetch;
+  bool WriteIfChanged(dl::IBuffer* buffer, ConstantCache& cache, const void* data, size_t size) {
+    if (cache.frame == frame && cache.bytes.size() == size &&
+        std::memcmp(cache.bytes.data(), data, size) == 0) {
+      ++constant_writes_skipped;
+      return false;
+    }
+    cache.frame = frame;
+    cache.bytes.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+    dl::MapHelper<uint8_t> map(context, buffer, dl::MAP_WRITE, dl::MAP_FLAG_DISCARD);
+    std::memcpy(map, data, size);
+    return true;
+  }
+  uint64_t constant_writes_skipped = 0;
+  dl::IRenderDevice* device;
+  dl::IDeviceContext* context;
+  TextureCache* textures;
+  uint64_t frame = 0;
+
+  dl::RefCntAutoPtr<dl::IBuffer> shared_memory;
+  // Uploaded ranges (start -> end, content hash), non-overlapping: an upload
+  // drops every range it overlaps, whose GPU copy it partly overwrote.
+  struct UploadedRange {
+    uint32_t end;
+    uint64_t hash;
+    uint64_t checked_frame;
+    uint64_t changed_frame;  // last frame the contents differed
+  };
+  // Ranges unchanged for this many frames are static: hashed once per frame.
+  // Others (dynamic buffers rewritten during the frame) are hashed per draw.
+  static constexpr uint64_t kStaticFrames = 60;
+  std::map<uint32_t, UploadedRange> uploaded;
+  dl::RefCntAutoPtr<dl::IBuffer> index_ring;
+  uint32_t index_ring_offset = 0;
+  std::vector<uint8_t> index_scratch;
+
+  dl::RefCntAutoPtr<dl::IBuffer> system_constants;
+  dl::RefCntAutoPtr<dl::IBuffer> float_vertex;
+  dl::RefCntAutoPtr<dl::IBuffer> float_pixel;
+  dl::RefCntAutoPtr<dl::IBuffer> bool_loop;
+  dl::RefCntAutoPtr<dl::IBuffer> fetch;
+
+  dl::RefCntAutoPtr<dl::ITexture> dummy_2d, dummy_3d, dummy_cube;
+  // Fetch constants (dwords 1-2) already reported as having no texture.
+  std::set<uint64_t> missing_textures;
+  dl::RefCntAutoPtr<dl::ISampler> dummy_sampler;
+
+  std::unordered_map<PipelineKey, Pipeline, PipelineKeyHash> pipelines;
+  PipelineStorage* storage = nullptr;
+  dl::IPipelineStateCache* pso_cache = nullptr;
+
+  uint32_t draws = 0, skipped_other = 0, pipeline_failures = 0;
+  uint32_t skipped_targets = 0, skipped_viewport = 0, skipped_scissor = 0, skipped_pipeline = 0;
+  uint64_t uploaded_bytes = 0;
+
+  bool Initialize();
+  dl::IBuffer* CreateUniform(const char* name, uint32_t size);
+  // always_check: data rewritten within a frame (inline vertices in the ring).
+  void Upload(const uint8_t* base, uint32_t address, uint32_t size, bool always_check = false);
+  // record: the draw's pipeline as stored, written when the pipeline is new.
+  Pipeline* GetPipeline(const PipelineKey& key, const TranslatedShaders& shaders,
+                        const StoredDraw* record = nullptr);
+  // Any thread.
+  dl::RefCntAutoPtr<dl::IPipelineState> CreatePso(const PipelineKey& key,
+                                                  const TranslatedShaders& shaders);
+  // Render thread: resource bindings of a created pipeline.
+  void FinishPipeline(Pipeline& p, const TranslatedShaders& shaders);
+  void BindStatic(Pipeline& pipeline, dl::SHADER_TYPE stage);
+};
+
+dl::IBuffer* DrawRenderer::Impl::CreateUniform(const char* name, uint32_t size) {
+  dl::BufferDesc desc;
+  desc.Name = name;
+  desc.Size = size;
+  desc.BindFlags = dl::BIND_UNIFORM_BUFFER;
+  desc.Usage = dl::USAGE_DYNAMIC;
+  desc.CPUAccessFlags = dl::CPU_ACCESS_WRITE;
+  dl::IBuffer* buffer = nullptr;
+  device->CreateBuffer(desc, nullptr, &buffer);
+  return buffer;
+}
+
+bool DrawRenderer::Impl::Initialize() {
+  dl::BufferDesc shared;
+  shared.Name = "XenosSharedMemory";
+  shared.Size = guest::kPhysicalMemorySize;
+  shared.BindFlags = dl::BIND_SHADER_RESOURCE | dl::BIND_UNORDERED_ACCESS;
+  shared.Usage = dl::USAGE_DEFAULT;
+  shared.Mode = dl::BUFFER_MODE_RAW;
+  shared.ElementByteStride = 4;
+  device->CreateBuffer(shared, nullptr, &shared_memory);
+
+  // Indices are written straight into host-visible (unified) memory when the
+  // memory is coherent; otherwise through UpdateBuffer as before.
+  dl::BufferDesc index;
+  index.Name = "XenosIndexRing";
+  index.Size = kIndexRingSize;
+  index.BindFlags = dl::BIND_INDEX_BUFFER;
+  index.Usage = dl::USAGE_UNIFIED;
+  index.CPUAccessFlags = dl::CPU_ACCESS_WRITE;
+  device->CreateBuffer(index, nullptr, &index_ring);
+  if (index_ring &&
+      (index_ring->GetMemoryProperties() & dl::MEMORY_PROPERTY_HOST_COHERENT) != 0) {
+    void* mapped = nullptr;
+    context->MapBuffer(index_ring, dl::MAP_WRITE, dl::MAP_FLAG_NONE, mapped);
+    index_ring_cpu = static_cast<uint8_t*>(mapped);
+  }
+  if (!index_ring_cpu) {
+    index_ring.Release();
+    index.Usage = dl::USAGE_DEFAULT;
+    index.CPUAccessFlags = dl::CPU_ACCESS_NONE;
+    device->CreateBuffer(index, nullptr, &index_ring);
+  }
+  REXLOG_INFO("NATIVE-DRAW index ring: {}", index_ring_cpu ? "unified, written directly"
+                                                          : "device memory, UpdateBuffer");
+
+  system_constants.Attach(
+      CreateUniform("XenosSystemConstants", sizeof(Translator::SystemConstants)));
+  float_vertex.Attach(CreateUniform("XenosFloatVS", 256 * 16));
+  float_pixel.Attach(CreateUniform("XenosFloatPS", 256 * 16));
+  bool_loop.Attach(CreateUniform("XenosBoolLoop", (8 + 32) * 4));
+  fetch.Attach(CreateUniform("XenosFetch", 6 * 32 * 4));
+
+  // Missing / unsupported textures read zero, like the SDK's null images.
+  const uint32_t zero[6] = {};
+  auto make_dummy = [&](dl::RESOURCE_DIMENSION dim, uint32_t layers,
+                        dl::RefCntAutoPtr<dl::ITexture>& out) {
+    dl::TextureDesc desc;
+    desc.Name = "XenosDummyTexture";
+    desc.Type = dim;
+    desc.Width = 1;
+    desc.Height = 1;
+    if (dim == dl::RESOURCE_DIM_TEX_3D) {
+      desc.Depth = 1;
+    } else {
+      desc.ArraySize = layers;
+    }
+    desc.Format = dl::TEX_FORMAT_RGBA8_UNORM;
+    desc.BindFlags = dl::BIND_SHADER_RESOURCE;
+    desc.Usage = dl::USAGE_IMMUTABLE;
+    std::vector<dl::TextureSubResData> subresources(layers, dl::TextureSubResData{zero, 4});
+    dl::TextureData data{subresources.data(), layers};
+    device->CreateTexture(desc, &data, &out);
+  };
+  make_dummy(dl::RESOURCE_DIM_TEX_2D_ARRAY, 1, dummy_2d);
+  make_dummy(dl::RESOURCE_DIM_TEX_3D, 1, dummy_3d);
+  make_dummy(dl::RESOURCE_DIM_TEX_CUBE, 6, dummy_cube);
+  dl::SamplerDesc sampler;
+  device->CreateSampler(sampler, &dummy_sampler);
+
+  bool ok = shared_memory && index_ring && system_constants && float_vertex && float_pixel &&
+            bool_loop && fetch && dummy_2d && dummy_3d && dummy_cube && dummy_sampler;
+  if (!ok) REXLOG_ERROR("NATIVE-DRAW: resource creation failed");
+  return ok;
+}
+
+void DrawRenderer::Impl::Upload(const uint8_t* base, uint32_t address, uint32_t size,
+                                bool always_check) {
+  if (!size || address >= guest::kPhysicalMemorySize) return;
+  size = std::min(size, guest::kPhysicalMemorySize - address);
+  uint32_t end = address + size;
+  auto it = uploaded.find(address);
+  if (!always_check && it != uploaded.end() && it->second.end == end &&
+      it->second.checked_frame == frame && frame - it->second.changed_frame > kStaticFrames) {
+    return;
+  }
+  const uint8_t* data = guest::PhysicalPtr(base, address);
+  if (always_check) {
+    // Inline vertex data in the command buffer is new for nearly every draw:
+    // upload without hashing it first (the range stays unknown to the cache).
+    auto first = uploaded.upper_bound(address);
+    if (first != uploaded.begin() && std::prev(first)->second.end > address) --first;
+    while (first != uploaded.end() && first->first < end) first = uploaded.erase(first);
+    context->UpdateBuffer(shared_memory, address, size, data,
+                          dl::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+    uploaded_bytes += size;
+    return;
+  }
+  uint64_t hash = XXH3_64bits(data, size);
+  if (it != uploaded.end() && it->second.end == end && it->second.hash == hash) {
+    it->second.checked_frame = frame;
+    return;
+  }
+  it = uploaded.upper_bound(address);
+  if (it != uploaded.begin() && std::prev(it)->second.end > address) --it;
+  while (it != uploaded.end() && it->first < end) it = uploaded.erase(it);
+  uploaded.emplace(address, UploadedRange{end, hash, frame, frame});
+  context->UpdateBuffer(shared_memory, address, size, data,
+                        dl::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+  uploaded_bytes += size;
+}
+
+// Binds everything that is the same object for every draw (textures start as dummies).
+void DrawRenderer::Impl::BindStatic(Pipeline& pipeline, dl::SHADER_TYPE stage) {
+  dl::IShaderResourceBinding* srb = pipeline.srb;
+  for (uint32_t i = 0, n = srb->GetVariableCount(stage); i < n; ++i) {
+    dl::IShaderResourceVariable* var = srb->GetVariableByIndex(stage, i);
+    dl::ShaderResourceDesc desc;
+    var->GetResourceDesc(desc);
+    std::string_view name = desc.Name;
+    // Block names (DiligentCore reflects uniform/storage blocks by type name).
+    if (name == "XeSharedMemory" || name == "xe_shared_memory") {
+      var->Set(shared_memory->GetDefaultView(desc.Type == dl::SHADER_RESOURCE_TYPE_BUFFER_UAV
+                                                 ? dl::BUFFER_VIEW_UNORDERED_ACCESS
+                                                 : dl::BUFFER_VIEW_SHADER_RESOURCE));
+    } else if (name == "XeSystemConstants") {
+      var->Set(system_constants);
+    } else if (name == "XeFloatConstants") {
+      var->Set(float_vertex);
+    } else if (name == "XeFloatConstantsPS") {
+      var->Set(float_pixel);
+    } else if (name == "XeBoolLoopConstants") {
+      var->Set(bool_loop);
+    } else if (name == "XeFetchConstants") {
+      var->Set(fetch);
+    } else if (name.find("xe_texture") != std::string_view::npos) {
+      dl::ITexture* dummy = name.find("_3d_") != std::string_view::npos     ? dummy_3d.RawPtr()
+                            : name.find("_cube_") != std::string_view::npos ? dummy_cube.RawPtr()
+                                                                            : dummy_2d.RawPtr();
+      var->Set(dummy->GetDefaultView(dl::TEXTURE_VIEW_SHADER_RESOURCE));
+      size_t digits = name.find("xe_texture") + 10;
+      uint32_t fc = 0;
+      while (digits < name.size() && name[digits] >= '0' && name[digits] <= '9') {
+        fc = fc * 10 + (name[digits++] - '0');
+      }
+      char dimension = dummy == dummy_3d.RawPtr() ? '3' : dummy == dummy_cube.RawPtr() ? 'c' : '2';
+      bool is_signed = name.size() >= 2 && name.substr(name.size() - 2) == "_s";
+      pipeline.textures.push_back({var, fc, dimension, is_signed});
+      pipeline.used_fetch_mask |= 1u << (fc & 31);
+    } else if (name.find("xe_sampler") != std::string_view::npos) {
+      var->Set(dummy_sampler);
+      SamplerVariable sampler{var};
+      if (ParseSamplerName(name, sampler)) pipeline.samplers.push_back(sampler);
+    } else {
+      REXLOG_WARN("NATIVE-DRAW: unknown shader resource '{}'", name);
+    }
+  }
+}
+
+Pipeline* DrawRenderer::Impl::GetPipeline(const PipelineKey& key,
+                                          const TranslatedShaders& shaders,
+                                          const StoredDraw* record) {
+  auto it = pipelines.find(key);
+  if (it != pipelines.end()) return it->second.pso ? &it->second : nullptr;
+  if (storage && record) storage->AddPipeline(*record);
+  Pipeline& p = pipelines[key];
+  p.pso = CreatePso(key, shaders);
+  ++g_render_stats.pipelines_created;
+  if (!p.pso) {
+    if (++pipeline_failures <= 8) {
+      REXLOG_WARN("NATIVE-DRAW: pipeline failed VS {:016X} PS {:016X} topology {}", key.vertex_key,
+                  key.pixel_key, key.topology);
+    }
+    return nullptr;
+  }
+  FinishPipeline(p, shaders);
+  return &p;
+}
+
+dl::RefCntAutoPtr<dl::IPipelineState> DrawRenderer::Impl::CreatePso(
+    const PipelineKey& key, const TranslatedShaders& shaders) {
+  dl::GraphicsPipelineStateCreateInfo ci;
+  ci.pPSOCache = pso_cache;
+  ci.PSODesc.Name = "XenosDraw";
+  ci.PSODesc.PipelineType = dl::PIPELINE_TYPE_GRAPHICS;
+  // Dynamic: textures and samplers change per draw.
+  ci.PSODesc.ResourceLayout.DefaultVariableType = dl::SHADER_RESOURCE_VARIABLE_TYPE_DYNAMIC;
+  ci.pVS = shaders.vertex;
+  ci.pPS = shaders.pixel;
+  auto& gp = ci.GraphicsPipeline;
+  gp.NumRenderTargets = uint8_t(key.color_count);
+  gp.BlendDesc.IndependentBlendEnable = dl::True;
+  for (uint32_t i = 0; i < key.color_count; ++i) {
+    gp.RTVFormats[i] = dl::TEXTURE_FORMAT(key.color_format[i]);
+    auto& rt = gp.BlendDesc.RenderTargets[i];
+    rt.RenderTargetWriteMask = dl::COLOR_MASK((key.color_mask >> (i * 4)) & 0xF);
+    if (key.blend[i]) {
+      reg::RB_BLENDCONTROL b;
+      b.value = key.blend[i];
+      rt.BlendEnable = dl::True;
+      rt.SrcBlend = BlendFactor(b.color_srcblend, false);
+      rt.DestBlend = BlendFactor(b.color_destblend, false);
+      rt.BlendOp = BlendOp(b.color_comb_fcn);
+      rt.SrcBlendAlpha = BlendFactor(b.alpha_srcblend, true);
+      rt.DestBlendAlpha = BlendFactor(b.alpha_destblend, true);
+      rt.BlendOpAlpha = BlendOp(b.alpha_comb_fcn);
+    }
+  }
+  gp.DSVFormat = dl::TEXTURE_FORMAT(key.depth_format);
+  gp.PrimitiveTopology = dl::PRIMITIVE_TOPOLOGY(key.topology);
+  // Framebuffer coordinates match the SDK Vulkan backend (the NDC transform
+  // undoes DiligentCore's Y flip), so its winding rule applies too: the front
+  // face is clockwise if PA_SU_SC_MODE_CNTL.face is set.
+  gp.RasterizerDesc.CullMode = (key.cull & 1)   ? dl::CULL_MODE_FRONT
+                               : (key.cull & 2) ? dl::CULL_MODE_BACK
+                                                : dl::CULL_MODE_NONE;
+  gp.RasterizerDesc.FrontCounterClockwise = (key.cull & 4) ? dl::False : dl::True;
+  // Polygon offset (SDK Vulkan host render target path).
+  gp.RasterizerDesc.DepthBias = key.depth_bias;
+  std::memcpy(&gp.RasterizerDesc.SlopeScaledDepthBias, &key.depth_bias_slope, sizeof(float));
+  gp.RasterizerDesc.ScissorEnable = dl::True;
+  gp.DepthStencilDesc.DepthEnable = key.depth_enable ? dl::True : dl::False;
+  gp.DepthStencilDesc.DepthWriteEnable = key.depth_write ? dl::True : dl::False;
+  gp.DepthStencilDesc.DepthFunc = dl::COMPARISON_FUNCTION(key.depth_func);
+  if (key.stencil_control) {
+    reg::RB_DEPTHCONTROL dc;
+    dc.value = key.stencil_control;
+    auto& ds = gp.DepthStencilDesc;
+    ds.StencilEnable = dl::True;
+    ds.StencilReadMask = uint8_t(key.stencil_masks & 0xFF);
+    ds.StencilWriteMask = uint8_t(key.stencil_masks >> 8);
+    ds.FrontFace = {StencilOp(dc.stencilfail), StencilOp(dc.stencilzfail),
+                    StencilOp(dc.stencilzpass), Compare(dc.stencilfunc)};
+    ds.BackFace =
+        dc.backface_enable
+            ? dl::StencilOpDesc{StencilOp(dc.stencilfail_bf), StencilOp(dc.stencilzfail_bf),
+                                StencilOp(dc.stencilzpass_bf), Compare(dc.stencilfunc_bf)}
+            : ds.FrontFace;
+  }
+  dl::RefCntAutoPtr<dl::IPipelineState> pso;
+  device->CreateGraphicsPipelineState(ci, &pso);
+  return pso;
+}
+
+void DrawRenderer::Impl::FinishPipeline(Pipeline& p, const TranslatedShaders& shaders) {
+  p.pso->CreateShaderResourceBinding(&p.srb, true);
+  BindStatic(p, dl::SHADER_TYPE_VERTEX);
+  if (shaders.pixel) BindStatic(p, dl::SHADER_TYPE_PIXEL);
+}
+
+DrawRenderer::DrawRenderer(dl::IRenderDevice* device, dl::IDeviceContext* context,
+                           TextureCache* textures)
+    : impl_(std::make_unique<Impl>()) {
+  impl_->device = device;
+  impl_->context = context;
+  impl_->textures = textures;
+  impl_->Initialize();
+}
+
+DrawRenderer::~DrawRenderer() = default;
+
+void DrawRenderer::SetFrame(uint64_t frame) { impl_->frame = frame; }
+void DrawRenderer::InvalidateBindings() { impl_->bindings_dirty = true; }
+
+void DrawRenderer::SetStorage(PipelineStorage* storage) { impl_->storage = storage; }
+
+void DrawRenderer::SetPipelineCache(dl::IPipelineStateCache* cache) { impl_->pso_cache = cache; }
+
+void DrawRenderer::Precompile(const std::vector<StoredDraw>& draws, const ShaderCache& shaders,
+                              const PipelineTargets& targets, uint32_t threads,
+                              const std::atomic<bool>& cancel, std::atomic<uint32_t>& done) {
+  Impl& m = *impl_;
+  struct Built {
+    bool ready = false;  // shaders built, key derived
+    PipelineKey key{};
+    TranslatedShaders shaders;
+    dl::RefCntAutoPtr<dl::IPipelineState> pso;
+  };
+  std::vector<Built> built(draws.size());
+  RunParallel(draws.size(), threads, [&](size_t i, uint32_t) {
+    const StoredPipeline& p = draws[i].pipeline;
+    Built& b = built[i];
+    // Records of another key derivation would need deriving again from
+    // their GuestDrawState; skipped until that changes.
+    bool current = p.key_version == kPipelineKeyVersion &&
+                   p.modification_version == Translator::Modification::kVersion;
+    if (!cancel && current &&
+        shaders.Find(p.vertex_hash, p.vertex_modification, b.shaders.vertex,
+                     b.shaders.vertex_info) &&
+        (!p.pixel_hash || shaders.Find(p.pixel_hash, p.pixel_modification, b.shaders.pixel,
+                                       b.shaders.pixel_info))) {
+      // The key as Draw derives it on this device and at this resolution.
+      b.ready = true;
+      b.key = p.key;
+      b.key.vertex_key = ShaderKey(p.vertex_hash, p.vertex_modification);
+      b.key.pixel_key = p.pixel_hash ? ShaderKey(p.pixel_hash, p.pixel_modification) : 0;
+      b.key.depth_format = p.key.depth_format ? targets.depth_format(p.key.depth_format - 1) : 0;
+      if (p.key.depth_format) {
+        float slope;
+        std::memcpy(&slope, &p.key.depth_bias_slope, sizeof(float));
+        float scale = (p.flags & kStoredPipelineShadowMap) ? targets.shadow_scale
+                                                           : targets.frame_scale;
+        slope *= xenos::kPolygonOffsetScaleSubpixelUnit * scale;
+        std::memcpy(&b.key.depth_bias_slope, &slope, sizeof(float));
+      }
+      if (!m.pipelines.count(b.key)) b.pso = m.CreatePso(b.key, b.shaders);
+    }
+    ++done;
+  });
+  uint32_t created = 0, failed = 0;
+  for (Built& b : built) {
+    if (!b.ready || m.pipelines.count(b.key)) continue;
+    if (!b.pso) {
+      ++failed;
+      continue;
+    }
+    Pipeline& p = m.pipelines[b.key];
+    p.pso = b.pso;
+    m.FinishPipeline(p, b.shaders);
+    ++created;
+  }
+  REXLOG_INFO("NATIVE-DRAW: precompiled {} of {} stored pipelines ({} failed)", created,
+              draws.size(), failed);
+}
+
+bool DrawRenderer::Draw(const rg::RegisterFile& regs, const TranslatedShaders& shaders,
+                        const DrawTargets& targets, const uint8_t* base, bool log,
+                        uint32_t volatile_fetch) {
+  Impl& m = *impl_;
+  if (!m.shared_memory || !shaders.vertex || !shaders.vertex_info) return false;
+  if (!targets.width || !targets.height) {
+    ++m.skipped_targets;
+    return false;
+  }
+
+  auto initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  uint32_t count = initiator.num_indices;
+  bool indexed = initiator.source_select == xenos::SourceSelect::kDMA;
+  if (!count) return false;
+
+  // Topology; fans and quad lists become triangle lists via index rewriting.
+  dl::PRIMITIVE_TOPOLOGY topology;
+  bool fan = false, quads = false, points = false;
+  switch (initiator.prim_type) {
+    case xenos::PrimitiveType::kLineList: topology = dl::PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+    case xenos::PrimitiveType::kLineStrip: topology = dl::PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
+    case xenos::PrimitiveType::kTriangleList:
+      topology = dl::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      break;
+    case xenos::PrimitiveType::kTriangleStrip:
+      topology = dl::PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+      break;
+    case xenos::PrimitiveType::kTriangleFan:
+      topology = dl::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      fan = true;
+      break;
+    case xenos::PrimitiveType::kQuadList:
+      topology = dl::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      quads = true;
+      break;
+    case xenos::PrimitiveType::kPointList:
+      // The translated VS (kPointListAsTriangleStrip) expands each point:
+      // host index = point << 2 | corner, drawn as restarted 4-vertex strips.
+      topology = dl::PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+      points = true;
+      break;
+    default: ++m.skipped_other; return false;
+  }
+
+  // Vertex data the shader fetches, uploaded raw (big-endian) to the shared memory mirror.
+  std::string vertex_log;
+  for (const auto& binding : shaders.vertex_info->vertex_bindings()) {
+    uint32_t d0 =
+        regs.values[rg::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 2];
+    uint32_t d1 =
+        regs.values[rg::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 2 + 1];
+    m.Upload(base, d0 & 0xFFFFFFFCu, ((d1 >> 2) & 0xFFFFFF) * 4,
+             binding.fetch_constant == volatile_fetch);
+    if (log) {
+      vertex_log += fmt::format(" vf{}={:08X}+{}/{}", binding.fetch_constant, d0 & 0xFFFFFFFCu,
+                                ((d1 >> 2) & 0xFFFFFF) * 4, binding.stride_words * 4);
+    }
+  }
+
+  // Indices: guest DMA indices (byte-swapped, reset index mapped to the host
+  // restart value) or generated for fans / quad lists, written to the ring.
+  bool index32 = indexed && initiator.index_size == xenos::IndexFormat::kInt32;
+  const uint8_t* index_src = nullptr;
+  xenos::Endian index_endian = xenos::Endian::kNone;
+  bool reset_enabled = false;
+  uint32_t reset = 0;
+  if (indexed) {
+    uint32_t dma_base = regs.values[rg::XE_GPU_REG_VGT_DMA_BASE];
+    index_src = guest::PhysicalPtr(base, dma_base & ~(index32 ? 3u : 1u));
+    index_endian = regs.Get<reg::VGT_DMA_SIZE>().swap_mode;
+    // Primitive reset only applies to strips (as in the SDK primitive processor).
+    reset_enabled = regs.Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena &&
+                    (topology == dl::PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                     topology == dl::PRIMITIVE_TOPOLOGY_LINE_STRIP) &&
+                    !points;
+    reset = regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
+  }
+  auto guest_index = [&](uint32_t i) -> uint32_t {
+    if (index32) {
+      uint32_t raw;
+      std::memcpy(&raw, index_src + i * 4, 4);
+      uint32_t v = xenos::GpuSwap(raw, index_endian);
+      return reset_enabled && (v & 0xFFFFFF) == reset ? 0xFFFFFFFFu : v;
+    }
+    uint16_t raw;
+    std::memcpy(&raw, index_src + i * 2, 2);
+    uint32_t v = index_endian == xenos::Endian::k8in16 ? uint16_t((raw << 8) | (raw >> 8)) : raw;
+    return reset_enabled && v == (reset & 0xFFFF) ? 0xFFFFu : v;
+  };
+  std::vector<uint32_t> indices;
+  uint32_t index_count = 0;
+  uint32_t point_index_load_address = 0;
+  xenos::Endian point_index_endian = xenos::Endian::kNone;
+  if (points) {
+    indices.reserve(size_t(count) * 5);
+    for (uint32_t i = 0; i < count; ++i) {
+      if (i) indices.push_back(0xFFFFFFFFu);
+      indices.insert(indices.end(), {i << 2, (i << 2) | 1, (i << 2) | 2, (i << 2) | 3});
+    }
+    if (indexed) {
+      uint32_t dma_base = regs.values[rg::XE_GPU_REG_VGT_DMA_BASE];
+      uint32_t index_bytes = index32 ? 4 : 2;
+      point_index_load_address = dma_base & ~(index_bytes - 1);
+      point_index_endian = index_endian;
+      if (!index32 && point_index_endian != xenos::Endian::kNone &&
+          point_index_endian != xenos::Endian::k8in16) {
+        point_index_endian = point_index_endian == xenos::Endian::k8in32 ? xenos::Endian::k8in16
+                                                                         : xenos::Endian::kNone;
+      }
+      m.Upload(base, point_index_load_address, count * index_bytes, true);
+    }
+    index32 = true;
+  } else if (fan || quads) {
+    auto vertex = [&](uint32_t i) { return indexed ? guest_index(i) : i; };
+    if (fan) {
+      for (uint32_t i = 2; i < count; ++i) {
+        indices.insert(indices.end(), {vertex(0), vertex(i - 1), vertex(i)});
+      }
+    } else {
+      for (uint32_t q = 0; q + 3 < count; q += 4) {
+        indices.insert(indices.end(), {vertex(q), vertex(q + 1), vertex(q + 2), vertex(q),
+                                       vertex(q + 2), vertex(q + 3)});
+      }
+    }
+    index32 = true;
+  }
+  uint32_t index_offset = 0;
+  dl::VALUE_TYPE index_type = index32 ? dl::VT_UINT32 : dl::VT_UINT16;
+  if (!indices.empty() || indexed) {
+    uint32_t stride = index32 ? 4 : 2;
+    index_count = indices.empty() ? count : uint32_t(indices.size());
+    uint32_t bytes = index_count * stride;
+    if (bytes > kIndexRingSize) return false;
+    m.index_scratch.resize(bytes);
+    if (!indices.empty()) {
+      std::memcpy(m.index_scratch.data(), indices.data(), bytes);
+    } else if (index32) {
+      ConvertIndices32(index_src, count, index_endian, reset_enabled, reset,
+                       reinterpret_cast<uint32_t*>(m.index_scratch.data()));
+    } else {
+      ConvertIndices16(index_src, count, index_endian == xenos::Endian::k8in16, reset_enabled,
+                       uint16_t(reset),
+                       reinterpret_cast<uint16_t*>(m.index_scratch.data()));
+    }
+    if (m.index_ring_offset + bytes > kIndexRingSize) m.index_ring_offset = 0;
+    index_offset = m.index_ring_offset;
+    if (m.index_ring_cpu) {
+      std::memcpy(m.index_ring_cpu + index_offset, m.index_scratch.data(), bytes);
+    } else {
+      m.context->UpdateBuffer(m.index_ring, index_offset, bytes, m.index_scratch.data(),
+                              dl::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+    }
+    m.index_ring_offset = (index_offset + bytes + 3) & ~3u;
+  }
+
+  // Constants (SDK Vulkan backend layout): the float constants a shader uses,
+  // packed in register order.
+  auto write_float_constants = [&](dl::IBuffer* buffer, Impl::ConstantCache& cache,
+                                   const rg::SpirvShader& info, uint32_t first_register) {
+    // Packed in register order (at most 256 vec4).
+    alignas(16) uint8_t packed[256 * 16];
+    uint8_t* out = packed;
+    const auto& bitmap = info.constant_register_map().float_bitmap;
+    for (uint32_t i = 0; i < 4; ++i) {
+      uint64_t bits = bitmap[i];
+      while (bits) {
+        uint32_t c = uint32_t(__builtin_ctzll(bits));
+        bits &= bits - 1;
+        std::memcpy(out, &regs.values[first_register + (i << 8) + (c << 2)], 16);
+        out += 16;
+      }
+    }
+    // An empty buffer still needs a mapping this frame.
+    size_t size = std::max<size_t>(out - packed, 16);
+    if (out == packed) std::memset(packed, 0, 16);
+    m.WriteIfChanged(buffer, cache, packed, size);
+  };
+  write_float_constants(m.float_vertex, m.cache_float_vertex, *shaders.vertex_info,
+                        rg::XE_GPU_REG_SHADER_CONSTANT_000_X);
+  if (shaders.pixel_info) {
+    write_float_constants(m.float_pixel, m.cache_float_pixel, *shaders.pixel_info,
+                          rg::XE_GPU_REG_SHADER_CONSTANT_256_X);
+  }
+  m.WriteIfChanged(m.bool_loop, m.cache_bool_loop,
+                   &regs.values[rg::XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], (8 + 32) * 4);
+  m.WriteIfChanged(m.fetch, m.cache_fetch, &regs.values[rg::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
+                   6 * 32 * 4);
+
+  // Viewport and system constants (host render target subset of
+  // VulkanCommandProcessor::UpdateSystemConstantValues).
+  auto depth_control = rg::draw_util::GetNormalizedDepthControl(regs);
+  rg::draw_util::ViewportInfo viewport;
+  const float scale_x = targets.scale_x, scale_y = targets.scale_y;
+  auto host_x = [&](uint32_t v) { return uint32_t(std::lround(double(v) * scale_x)); };
+  auto host_y = [&](uint32_t v) { return uint32_t(std::lround(double(v) * scale_y)); };
+  // Guest pixels, scaled below (the NDC transform does not depend on the scale).
+  rg::draw_util::GetHostViewportInfo(regs, 1, 1, false, 16384, 16384, true, depth_control, false,
+                                     true, shaders.pixel_info && shaders.pixel_info->writes_depth(),
+                                     viewport);
+  for (uint32_t i = 0; i < 2; ++i) {
+    auto scale_axis = [&](uint32_t v) { return i ? host_y(v) : host_x(v); };
+    uint32_t end = scale_axis(viewport.xy_offset[i] + viewport.xy_extent[i]);
+    viewport.xy_offset[i] = scale_axis(viewport.xy_offset[i]);
+    viewport.xy_extent[i] = end - viewport.xy_offset[i];
+  }
+  if (!viewport.xy_extent[0] || !viewport.xy_extent[1]) {
+    ++m.skipped_viewport;
+    return false;
+  }
+  // Uploaded after the textures are bound (textures_resolution_scaled).
+  Translator::SystemConstants sc;
+  std::memset(&sc, 0, sizeof(sc));
+  {
+    auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+    auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+    uint32_t flags = 0;
+    if (vte.vtx_xy_fmt) flags |= Translator::kSysFlag_XYDividedByW;
+    if (vte.vtx_z_fmt) flags |= Translator::kSysFlag_ZDividedByW;
+    if (vte.vtx_w0_fmt) flags |= Translator::kSysFlag_WNotReciprocal;
+    if (!points && (topology == dl::PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ||
+                    topology == dl::PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)) {
+      flags |= Translator::kSysFlag_PrimitivePolygonal;
+    }
+    if (points && indexed) {
+      flags |= Translator::kSysFlag_ComputeOrPrimitiveVertexIndexLoad;
+      if (initiator.index_size == xenos::IndexFormat::kInt32) {
+        flags |= Translator::kSysFlag_ComputeOrPrimitiveVertexIndexLoad32Bit;
+      }
+    }
+    if (rg::draw_util::IsPrimitiveLine(regs)) flags |= Translator::kSysFlag_PrimitiveLine;
+    if (regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
+      flags |= Translator::kSysFlag_DepthFloat24;
+    }
+    auto alpha_func =
+        colorcontrol.alpha_test_enable ? colorcontrol.alpha_func : xenos::CompareFunction::kAlways;
+    flags |= uint32_t(alpha_func) << Translator::kSysFlag_AlphaPassIfLess_Shift;
+    for (uint32_t i = 0; i < 4; ++i) {
+      auto info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+      if (info.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+        flags |= Translator::kSysFlag_ConvertColor0ToGamma << i;
+      }
+      // 7e3 kept in 16-bit float: outputs limited to the 360's range.
+      if (i == 0 && (info.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+                     info.color_format ==
+                         xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
+        flags |= Translator::kSysFlag_HostClampColor0To7e3;
+      }
+      float scale;
+      int32_t bias = info.color_exp_bias;
+      uint32_t bits = 0x3F800000u + uint32_t(bias << 23);
+      std::memcpy(&scale, &bits, 4);
+      sc.color_exp_bias[i] = scale;
+    }
+    sc.flags = flags;
+    // Indices are swapped on upload, except guest indices points load in the VS.
+    sc.vertex_index_endian = point_index_endian;
+    sc.vertex_index_load_address = point_index_load_address;
+    if (points) {
+      auto minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
+      auto size = regs.Get<reg::PA_SU_POINT_SIZE>();
+      sc.point_vertex_diameter_min = float(minmax.min_size) * (2.0f / 16.0f);
+      sc.point_vertex_diameter_max = float(minmax.max_size) * (2.0f / 16.0f);
+      sc.point_constant_diameter[0] = float(size.width) * (2.0f / 16.0f);
+      sc.point_constant_diameter[1] = float(size.height) * (2.0f / 16.0f);
+      sc.point_screen_diameter_to_ndc_radius[0] = scale_x / std::max(viewport.xy_extent[0], 1u);
+      sc.point_screen_diameter_to_ndc_radius[1] = scale_y / std::max(viewport.xy_extent[1], 1u);
+    }
+    sc.vertex_base_index = int32_t(regs.values[rg::XE_GPU_REG_VGT_INDX_OFFSET]);
+    sc.vertex_index_min = regs.values[rg::XE_GPU_REG_VGT_MIN_VTX_INDX];
+    sc.vertex_index_max = regs.values[rg::XE_GPU_REG_VGT_MAX_VTX_INDX];
+    for (uint32_t i = 0; i < 3; ++i) {
+      sc.ndc_scale[i] = viewport.ndc_scale[i];
+      sc.ndc_offset[i] = viewport.ndc_offset[i];
+    }
+    // DiligentCore flips Vulkan Y with a negative viewport height; undo it.
+    sc.ndc_scale[1] = -sc.ndc_scale[1];
+    sc.ndc_offset[1] = -sc.ndc_offset[1];
+    std::memcpy(&sc.alpha_test_reference, &regs.values[rg::XE_GPU_REG_RB_ALPHA_REF], 4);
+    sc.alpha_to_mask =
+        colorcontrol.alpha_to_mask_enable ? (colorcontrol.value >> 24) | (1u << 8) : 0;
+    // Post-swizzle signs (incl. gamma) of every fetch constant a shader samples.
+    uint32_t used = 0;
+    for (const auto* info : {shaders.vertex_info, shaders.pixel_info}) {
+      if (!info) continue;
+      for (const auto& binding : info->GetTextureBindingsAfterTranslation()) {
+        used |= 1u << binding.fetch_constant;
+      }
+    }
+    while (used) {
+      uint32_t fc = uint32_t(__builtin_ctz(used));
+      used &= used - 1;
+      rex::graphics::xenos::xe_gpu_texture_fetch_t fetch;
+      std::memcpy(&fetch, &regs.values[rg::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fc * 6],
+                  sizeof(fetch));
+      uint8_t signs = rg::texture_util::SwizzleSigns(fetch);
+      sc.texture_swizzled_signs[fc >> 2] |= uint32_t(signs) << (8 * (fc & 3));
+      // Unsigned normalized fixed-point fetches round like the guest's filtering.
+      if (!fetch.num_format && !signs && rg::FormatInfo::Get(fetch.format)->fixed) {
+        sc.textures_round_normalized |= 1u << fc;
+      }
+    }
+  }
+
+  PipelineKey key{};
+  key.vertex_key = shaders.vertex_key;
+  key.pixel_key = shaders.pixel_key;
+  key.topology = topology;
+  key.color_count = targets.color_count;
+  for (uint32_t i = 0; i < targets.color_count; ++i) key.color_format[i] = targets.color_format[i];
+  key.depth_format = targets.depth ? targets.depth_format : 0;
+  // Only the render targets the pixel shader writes (none without one), as the SDK.
+  key.color_mask = shaders.pixel_info ? rg::draw_util::GetNormalizedColorMask(
+                                            regs, shaders.pixel_info->writes_color_targets())
+                                      : 0;
+  key.depth_enable = targets.depth && depth_control.z_enable;
+  key.depth_write = targets.depth && depth_control.z_write_enable;
+  key.depth_func = uint32_t(depth_control.zfunc) + 1;  // xenos -> COMPARISON_FUNCTION
+  for (uint32_t i = 0; i < key.color_count; ++i) {
+    static constexpr uint32_t kBlendRegs[4] = {
+        rg::XE_GPU_REG_RB_BLENDCONTROL0, rg::XE_GPU_REG_RB_BLENDCONTROL1,
+        rg::XE_GPU_REG_RB_BLENDCONTROL2, rg::XE_GPU_REG_RB_BLENDCONTROL3};
+    uint32_t blend = regs.values[kBlendRegs[i]] & 0x1FFF1FFF;
+    // 1 * src + 0 * dst for color and alpha = blending off.
+    key.blend[i] = blend == 0x00010001 ? 0 : blend;
+  }
+  auto stencil_refmask = regs.Get<reg::RB_STENCILREFMASK>();
+  if (targets.depth && depth_control.stencil_enable) {
+    key.stencil_control = depth_control.value & 0xFFFFFF81u;  // stencil enable + funcs/ops
+    key.stencil_masks = stencil_refmask.stencilmask | (stencil_refmask.stencilwritemask << 8);
+  }
+  if (rg::draw_util::IsPrimitivePolygonal(regs)) {
+    auto mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+    if (mode_cntl.cull_front && mode_cntl.cull_back) {
+      ++m.skipped_other;
+      return false;  // both faces culled: nothing is drawn
+    }
+    key.cull = (mode_cntl.cull_front ? 1u : 0u) | (mode_cntl.cull_back ? 2u : 0u) |
+               (mode_cntl.face ? 4u : 0u);
+  }
+  float unscaled_slope = 0.0f;
+  if (targets.depth) {
+    float slope = 0.0f, constant = 0.0f;
+    rg::draw_util::GetPreferredFacePolygonOffset(regs, rg::draw_util::IsPrimitivePolygonal(regs),
+                                                 slope, constant);
+    constant *=
+        regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8
+            ? rg::draw_util::kD3D10PolygonOffsetFactorUnorm24
+            : rg::draw_util::kD3D10PolygonOffsetFactorFloat24;
+    unscaled_slope = slope;
+    slope *= xenos::kPolygonOffsetScaleSubpixelUnit * std::max(scale_x, scale_y);
+    key.depth_bias = int32_t(std::lround(constant));
+    std::memcpy(&key.depth_bias_slope, &slope, sizeof(float));
+  }
+  // The pipeline in guest terms, recorded the first time it is created.
+  StoredDraw record{};
+  if (m.storage) {
+    StoredPipeline& p = record.pipeline;
+    p.vertex_hash = shaders.vertex_hash;
+    p.vertex_modification = shaders.vertex_modification;
+    p.pixel_hash = shaders.pixel_info ? shaders.pixel_hash : 0;
+    p.pixel_modification = shaders.pixel_info ? shaders.pixel_modification : 0;
+    p.key = key;
+    p.key.vertex_key = 0;
+    p.key.pixel_key = 0;
+    p.key.depth_format = targets.depth ? targets.guest_depth_format + 1 : 0;
+    std::memcpy(&p.key.depth_bias_slope, &unscaled_slope, sizeof(float));
+    p.flags = targets.shadow_map ? kStoredPipelineShadowMap : 0;
+    p.key_version = kPipelineKeyVersion;
+    p.modification_version = Translator::Modification::kVersion;
+    GuestDrawState& g = record.state;
+    uint32_t index = 0;
+    for (uint32_t r = 0; r < kStoredContextRanges; ++r) {
+      for (uint32_t i = 0; i < kShadowRanges[r].count; ++i) {
+        g.registers[index++] = regs.values[kShadowRanges[r].reg + i];
+      }
+    }
+    g.draw_initiator = initiator.value & 0xFFFF;
+    for (uint32_t i = 0; i < targets.color_count; ++i) {
+      g.color_formats[i] = targets.guest_color_format[i];
+    }
+    g.color_count = targets.color_count;
+    g.depth_format = p.key.depth_format;
+    g.flags = p.flags;
+  }
+  Pipeline* pipeline = m.GetPipeline(key, shaders, m.storage ? &record : nullptr);
+  if (!pipeline) {
+    ++m.skipped_pipeline;
+    return false;
+  }
+
+  // Textures and samplers of this draw.
+  bool bindings_changed = false;
+  const uint32_t* fetch_base = &regs.values[rg::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
+  std::string texture_log;
+  // Video frames (VP6 decoded to Y/U/V k_8 planes, drawn full screen): 16:9
+  // content that must not be widened by an anamorphic (ultrawide) scale.
+  uint32_t video_planes = 0;
+  bool video_luma = false;
+  for (const TextureVariable& t : pipeline->textures) {
+    const uint32_t* fetch = fetch_base + (t.fetch_constant & 31) * 6;
+    char source = '-';
+    // The signed binding is only sampled for signed components.
+    xenos::xe_gpu_texture_fetch_t fetch_constant;
+    std::memcpy(&fetch_constant, fetch, sizeof(fetch_constant));
+    bool want_signed = t.is_signed && rg::texture_util::IsAnySignSigned(
+                                          rg::texture_util::SwizzleSigns(fetch_constant));
+    dl::ITextureView* view =
+        t.dimension == '3'   ? m.textures->GetView3D(fetch, base, m.frame, &source, want_signed)
+        : t.dimension == 'c' ? m.textures->GetViewCube(fetch, base, m.frame, &source, want_signed)
+                             : m.textures->GetView2D(fetch, base, m.frame, &source, want_signed);
+    if (log) {
+      texture_log += fmt::format(" t{}{}={:08X}:{}x{}:f{}{}", t.fetch_constant,
+                                 t.is_signed ? (want_signed ? "s" : "s~") : "",
+                                 fetch[1] & 0xFFFFF000u, (fetch[2] & 0x1FFF) + 1,
+                                 ((fetch[2] >> 13) & 0x1FFF) + 1, fetch[1] & 0x3F, source);
+    }
+    dl::ITexture* dummy = t.dimension == '3'   ? m.dummy_3d.RawPtr()
+                          : t.dimension == 'c' ? m.dummy_cube.RawPtr()
+                                               : m.dummy_2d.RawPtr();
+    // 3D fetches also get a 2D (stacked) binding; the shader picks one by the
+    // fetch constant's dimension, so the other one is unused.
+    bool unused_binding =
+        (t.dimension == '3') != (fetch_constant.dimension == xenos::DataDimension::k3D);
+    if (!view && !unused_binding &&
+        m.missing_textures.insert((uint64_t(fetch[1]) << 32) | fetch[2]).second &&
+        m.missing_textures.size() <= 64) {
+      REXLOG_INFO(
+          "NATIVE-TEX no texture for fetch {} ({}): {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+          t.fetch_constant, t.dimension, fetch[0], fetch[1], fetch[2], fetch[3], fetch[4],
+          fetch[5]);
+    }
+    if (fetch_constant.format == xenos::TextureFormat::k_8 && !t.is_signed) {
+      ++video_planes;
+      video_luma |= fetch_constant.size_2d.width + 1 >= 640;
+    }
+    if (view && source == 'R' && (scale_x != 1.0f || scale_y != 1.0f)) {
+      sc.textures_resolution_scaled |= 1u << (t.fetch_constant & 31);
+    }
+    dl::IDeviceObject* object =
+        view ? static_cast<dl::IDeviceObject*>(view)
+             : static_cast<dl::IDeviceObject*>(dummy->GetDefaultView(dl::TEXTURE_VIEW_SHADER_RESOURCE));
+    if (t.bound != object) {
+      t.variable->Set(object);
+      t.bound = object;
+      bindings_changed = true;
+    }
+  }
+  for (const SamplerVariable& s : pipeline->samplers) {
+    const uint32_t* fetch = fetch_base + (s.fetch_constant & 31) * 6;
+    dl::ISampler* sampler = m.textures->GetSampler(fetch, s.mag, s.min, s.mip, s.aniso);
+    dl::IDeviceObject* object = sampler ? sampler : m.dummy_sampler.RawPtr();
+    if (s.bound != object) {
+      s.variable->Set(object);
+      s.bound = object;
+      bindings_changed = true;
+    }
+  }
+  {
+    dl::MapHelper<Translator::SystemConstants> map(m.context, m.system_constants, dl::MAP_WRITE,
+                                                   dl::MAP_FLAG_DISCARD);
+    *map = sc;
+  }
+
+  dl::ITextureView* rtvs[4] = {};
+  for (uint32_t i = 0; i < targets.color_count; ++i) rtvs[i] = targets.color[i];
+  m.context->SetRenderTargets(targets.color_count, rtvs, targets.depth,
+                              dl::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+  dl::Viewport vp;
+  vp.TopLeftX = float(viewport.xy_offset[0]);
+  vp.TopLeftY = float(viewport.xy_offset[1]);
+  vp.Width = float(viewport.xy_extent[0]);
+  vp.Height = float(viewport.xy_extent[1]);
+  vp.MinDepth = viewport.z_min;
+  vp.MaxDepth = viewport.z_max;
+  static constexpr std::array<uint64_t, 3> kUiVertexShaders = {
+      0xC40DC095B70946ACull, 0x2ED7EB623067A9D5ull, 0x3BF4A4C9E3389AA3ull};
+  const uint64_t vertex_ucode_hash = shaders.vertex_info->ucode_data_hash();
+  const bool ui_squeeze =
+      scale_x > scale_y && REXCVAR_GET(dante_ui_16_9) &&
+      std::find(kUiVertexShaders.begin(), kUiVertexShaders.end(), vertex_ucode_hash) !=
+          kUiVertexShaders.end();
+  const float ui_center = 0.5f * float(host_x(targets.width));
+  const float ui_factor = scale_y / scale_x;
+  if (ui_squeeze) {
+    vp.TopLeftX = ui_center + (vp.TopLeftX - ui_center) * ui_factor;
+    vp.Width *= ui_factor;
+  } else if (video_planes >= 3 && video_luma && scale_x != scale_y) {
+    // Squeeze around the render target's centre back to the 16:9 shape:
+    // pillarbox on wider aspects, letterbox on narrower ones.
+    if (scale_x > scale_y) {
+      float squeeze = scale_y / scale_x;
+      float center = 0.5f * float(host_x(targets.width));
+      vp.TopLeftX = center + (vp.TopLeftX - center) * squeeze;
+      vp.Width *= squeeze;
+    } else {
+      float squeeze = scale_x / scale_y;
+      float center = 0.5f * float(host_y(targets.height));
+      vp.TopLeftY = center + (vp.TopLeftY - center) * squeeze;
+      vp.Height *= squeeze;
+    }
+  }
+  const uint32_t host_width = host_x(targets.width), host_height = host_y(targets.height);
+  m.context->SetViewports(1, &vp, host_width, host_height);
+  rg::draw_util::Scissor scissor;
+  rg::draw_util::GetScissor(regs, scissor);
+  dl::Rect rect{int32_t(host_x(scissor.offset[0])), int32_t(host_y(scissor.offset[1])),
+                int32_t(std::min(host_x(scissor.offset[0] + scissor.extent[0]), host_width)),
+                int32_t(std::min(host_y(scissor.offset[1] + scissor.extent[1]), host_height))};
+  if (ui_squeeze) {
+    rect.left = int32_t(std::floor(ui_center + (float(rect.left) - ui_center) * ui_factor));
+    rect.right = int32_t(std::ceil(ui_center + (float(rect.right) - ui_center) * ui_factor));
+  }
+  if (rect.right <= rect.left || rect.bottom <= rect.top) {
+    ++m.skipped_scissor;
+    return false;
+  }
+  m.context->SetScissorRects(1, &rect, host_width, host_height);
+  m.context->SetPipelineState(pipeline->pso);
+  if (key.stencil_control) m.context->SetStencilRef(stencil_refmask.stencilref);
+  float blend_constant[4];
+  std::memcpy(blend_constant, &regs.values[rg::XE_GPU_REG_RB_BLEND_RED], sizeof(blend_constant));
+  m.context->SetBlendFactors(blend_constant);
+  // Commit (descriptor writes + state transitions) only when the bindings or
+  // the resources' states may have changed: another pipeline's resources, a new
+  // object bound, a texture upload, or a resolve / clear since the last commit.
+  uint32_t uploads = m.textures->UploadCount();
+  if (bindings_changed || pipeline->srb != m.last_srb || uploads != m.last_uploads ||
+      m.bindings_dirty) {
+    m.context->CommitShaderResources(pipeline->srb, dl::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+    m.last_srb = pipeline->srb;
+    m.last_uploads = uploads;
+    m.bindings_dirty = false;
+  } else {
+    ++m.commits_skipped;
+  }
+
+  if (index_count) {
+    m.context->SetIndexBuffer(m.index_ring, index_offset,
+                              dl::RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+    dl::DrawIndexedAttribs attribs;
+    attribs.NumIndices = index_count;
+    attribs.IndexType = index_type;
+    m.context->DrawIndexed(attribs);
+  } else {
+    dl::DrawAttribs attribs;
+    attribs.NumVertices = count;
+    m.context->Draw(attribs);
+  }
+  ++m.draws;
+  if (log) {
+    REXLOG_INFO(
+        "NATIVE-DRAW prim={} count={} {} idx={} vp=({},{} {}x{} z {:.3f}..{:.3f}) "
+        "ndc=({:.4f},{:.4f},{:.4f})+({:.4f},{:.4f},{:.4f}) scissor=({},{})-({},{}) rt={}x{} "
+        "colors={} depth={} zfunc={} ztest={} mask={:04X} blend={:08X} vs={:016X} ps={:016X}{}{}",
+        uint32_t(initiator.prim_type), count, indexed ? "dma" : "auto", index_count,
+        viewport.xy_offset[0], viewport.xy_offset[1], viewport.xy_extent[0], viewport.xy_extent[1],
+        viewport.z_min, viewport.z_max, viewport.ndc_scale[0], viewport.ndc_scale[1],
+        viewport.ndc_scale[2], viewport.ndc_offset[0], viewport.ndc_offset[1],
+        viewport.ndc_offset[2], rect.left, rect.top, rect.right, rect.bottom, targets.width,
+        targets.height, targets.color_count, targets.depth != nullptr, key.depth_func,
+        key.depth_enable, key.color_mask, key.blend[0], shaders.vertex_info->ucode_data_hash(),
+        shaders.pixel_info ? shaders.pixel_info->ucode_data_hash() : 0, vertex_log, texture_log);
+  }
+  return true;
+}
+
+void DrawRenderer::LogStats() {
+  REXLOG_INFO(
+      "NATIVE-DRAW draws={} pipelines={} pipeline_failures={} skipped: other={} "
+      "targets={} viewport={} scissor={} pipeline={} uploaded={} KB",
+      impl_->draws, impl_->pipelines.size(), impl_->pipeline_failures, impl_->skipped_other,
+      impl_->skipped_targets, impl_->skipped_viewport, impl_->skipped_scissor,
+      impl_->skipped_pipeline, impl_->uploaded_bytes / 1024);
+}
+
+}  // namespace renderer

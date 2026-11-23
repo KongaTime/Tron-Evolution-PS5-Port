@@ -1,0 +1,24 @@
+/build/
+/release/
+# Generated code and game files: never commit these
+recomp/generated/
+recomp/assets/
+recomp/codegen.log
+*.xex
+*.xexp
+gamedata/
+
+# Build output, logs and local copies (the runtime copy is kept as patches/rexglue-tron-native.patch)
+*.log
+/nat/
+/pgo/
+/rexglue-sdk-bully/
+/games/tron-pgogen
+/games/tron-pgouse
+/native/thirdparty/diligent-core
+*.prethread
+# Decrypted game image (game code): never commit
+/work/
+
+# Home-screen art (official key art): kept locally, not in git
+title-art/
