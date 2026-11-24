@@ -10,9 +10,9 @@ Play Tron: Evolution on a homebrew-enabled PS5. The port runs the Xbox 360 game 
   <img src="docs/launcher.png" alt="The Tron: Evolution Recomp launcher" width="720">
 </p>
 
-## Install V1.0
+## Install V1.0.1
 
-1. Download `Tron.Evolution.PS5.Port.V1.0.zip` from [GitHub Releases](https://github.com/KongaTime/Tron-Evolution-PS5-Port/releases/tag/v1.0).
+1. Download `Tron.Evolution.PS5.Port.V1.0.1.zip` from [GitHub Releases](https://github.com/KongaTime/Tron-Evolution-PS5-Port/releases/tag/v1.0.1).
 2. Extract the `PPSA90120` folder to `/data/homebrew/` on a PS5 set up to run homebrew. Register the title with ShadowMount+.
 3. Create a `dump` folder inside `PPSA90120` and place your Xbox 360 disc ISO in it.
 4. Open **Tron Evolution** on the PS5 and choose **PLAY**. The launcher checks the disc and starts the game. The disc isn't copied: the game reads it directly from `dump/`, so leave the ISO there.
@@ -40,7 +40,7 @@ Choose **SETTINGS** in the launcher. Up/Down moves, Left/Right or Cross changes 
 
 - **Native renderer.** The Xbox 360's graphics calls are drawn directly with Vulkan on the PS5 instead of emulating its GPU, which removes the white flashes of GPU emulation and runs the game at 60 fps at 1440p. The busiest scenes run in the 50s.
 - **Plays from your ISO.** Nothing is extracted or copied to the console.
-- **PlayStation button prompts** in the game's own menu and in-game styles.
+- **PlayStation button prompts** in the game's own menu and in-game styles, including the combo list.
 - **Achievements** unlock as on the Xbox 360, are saved between sessions, and pop up with a Tron-styled notification and sound.
 - **Smooth frame pacing**, with work sent to the GPU as each frame is recorded and four screen buffers.
 - **Colour matched to the Xbox 360**, with the game's own gamma ramp, the 360's HDR render target ranges, and a tuned presentation curve.

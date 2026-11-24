@@ -1788,6 +1788,13 @@ constexpr TronIcon kTronIcons[] = {
     {0xBC0693B19D62E00Eull, "playstation_trigger_r2_alternative", false},  // RT
     {0xCE400C06D68033ACull, "playstation_button_color_square", false},     // X
     {0x50678491D8299AEEull, "playstation_button_color_circle", false},     // B
+    // The combo list's set.
+    {0xC3143FEB068B24AEull, "playstation_button_color_cross", false},      // A
+    {0x6136C26029F4C132ull, "playstation_button_color_circle", false},     // B
+    {0xB9494C9BEC44C027ull, "playstation_button_color_square", false},     // X
+    {0xCBC864D613B0A586ull, "playstation_button_color_triangle", false},   // Y
+    {0x400BD7735EAA3DF5ull, "playstation_trigger_l2_alternative", false},  // LT
+    {0xD1F8F6CF610824B3ull, "playstation_trigger_r2_alternative", false},  // RT
 };
 
 // The cut-out symbol of a Kenney icon as coverage (0..1), cropped to its ink.
